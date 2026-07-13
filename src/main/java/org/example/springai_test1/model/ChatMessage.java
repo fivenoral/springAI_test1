@@ -1,0 +1,99 @@
+package org.example.springai_test1.model;
+
+import jakarta.persistence.*;
+import java.time.LocalDateTime;
+
+/**
+ * 聊天消息实体（JPA），映射到 chat_messages 表
+ */
+@Entity
+@Table(name = "chat_messages")
+public class ChatMessage {
+
+    /** 自增主键 */
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    /** 消息角色：user / assistant / system */
+    @Column(nullable = false)
+    private String role;
+
+    /** 消息内容 */
+    @Column(nullable = false, columnDefinition = "TEXT")
+    private String content;
+
+    /** 使用的模型名称 */
+    @Column(nullable = false)
+    private String model;
+
+    /** 消息时间戳 */
+    @Column(nullable = false)
+    private LocalDateTime timestamp;
+
+    /** 所属会话（多对一） */
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "conversation_id", nullable = false)
+    private Conversation conversation;
+
+    public ChatMessage() {
+        this.timestamp = LocalDateTime.now();
+    }
+
+    public ChatMessage(String role, String content, String model) {
+        this.role = role;
+        this.content = content;
+        this.model = model;
+        this.timestamp = LocalDateTime.now();
+    }
+
+    // ==================== Getters & Setters ====================
+
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public String getRole() {
+        return role;
+    }
+
+    public void setRole(String role) {
+        this.role = role;
+    }
+
+    public String getContent() {
+        return content;
+    }
+
+    public void setContent(String content) {
+        this.content = content;
+    }
+
+    public String getModel() {
+        return model;
+    }
+
+    public void setModel(String model) {
+        this.model = model;
+    }
+
+    public LocalDateTime getTimestamp() {
+        return timestamp;
+    }
+
+    public void setTimestamp(LocalDateTime timestamp) {
+        this.timestamp = timestamp;
+    }
+
+    public Conversation getConversation() {
+        return conversation;
+    }
+
+    public void setConversation(Conversation conversation) {
+        this.conversation = conversation;
+    }
+}
