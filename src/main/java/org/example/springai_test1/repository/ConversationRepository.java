@@ -1,6 +1,9 @@
 package org.example.springai_test1.repository;
 
+import org.example.springai_test1.model.ChatMessage;
+import org.example.springai_test1.model.ChatMessageHis;
 import org.example.springai_test1.model.Conversation;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -16,14 +19,15 @@ import java.util.Optional;
 @Repository("conversationRepository")
 public class ConversationRepository {
 
-    private final ConversationJpaRepo conversationJpaRepo;
-    private final ChatMessageJpaRepo chatMessageJpaRepo;
+    @Autowired
+    private ConversationJpaRepo conversationJpaRepo;
 
-    public ConversationRepository(ConversationJpaRepo conversationJpaRepo,
-                                  ChatMessageJpaRepo chatMessageJpaRepo) {
-        this.conversationJpaRepo = conversationJpaRepo;
-        this.chatMessageJpaRepo = chatMessageJpaRepo;
-    }
+    @Autowired
+    private ChatMessageJpaRepo chatMessageJpaRepo;
+
+    @Autowired
+    private ChatMessageHisJpaRepo chatMessageHisJpaRepo;
+
 
     /**
      * 保存或更新对话
@@ -83,5 +87,39 @@ public class ConversationRepository {
     public void deleteAll() {
         chatMessageJpaRepo.deleteAll();
         conversationJpaRepo.deleteAll();
+    }
+
+    /**
+     * 获取指定对话的所有消息
+     */
+    public List<ChatMessage> findMessagesByConversationId(String conversationId) {
+        return chatMessageJpaRepo.findByConversationIdOrderByTimestampAsc(conversationId);
+    }
+
+    /**
+     * 保存消息
+     */
+    @Transactional
+    public ChatMessage saveMessage(ChatMessage message) {
+        return chatMessageJpaRepo.save(message);
+    }
+
+    /**
+     * 清除指定对话的所有消息
+     */
+    @Transactional
+    public void clearMessages(String conversationId) {
+        // 物理删除主表数据
+        chatMessageJpaRepo.deleteByConversationId(conversationId);
+        // 逻辑删除历史表数据
+        chatMessageHisJpaRepo.invalidateByConversationId(conversationId);
+    }
+
+    /**
+     * 保存历史消息
+     */
+    @Transactional
+    public ChatMessageHis saveMessageHis(ChatMessageHis messageHis) {
+        return chatMessageHisJpaRepo.save(messageHis);
     }
 }

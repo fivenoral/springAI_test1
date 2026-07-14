@@ -74,6 +74,7 @@
         .model-openai { color: #10a37f; }
         .model-deepseek { color: #1976d2; }
         .model-qwen { color: #ff6f00; }
+        .model-teacher { color: #e91e63; }
     </style>
 </head>
 <body>
@@ -94,6 +95,7 @@
                     <option value="openai">OpenAI (GPT-4o)</option>
                     <option value="deepseek">DeepSeek</option>
                     <option value="qwen">通义千问 (Qwen)</option>
+                    <option value="teacher">温柔老师</option>
                 </select>
                 <button onclick="newConversation()">+ 新建对话</button>
             </div>
@@ -331,7 +333,7 @@
 
         // ==================== 工具函数 ====================
         function getModelLabel(model) {
-            const labels = { openai: 'OpenAI', deepseek: 'DeepSeek', qwen: '通义千问' };
+            const labels = { openai: 'OpenAI', deepseek: 'DeepSeek', qwen: '通义千问', teacher: '温柔老师' };
             return labels[model] || model;
         }
 

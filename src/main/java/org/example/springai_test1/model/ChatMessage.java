@@ -4,10 +4,10 @@ import jakarta.persistence.*;
 import java.time.LocalDateTime;
 
 /**
- * 聊天消息实体（JPA），映射到 chat_messages 表
+ * 聊天消息实体（JPA），映射到 BSG_CHAT_MESSAGE 表
  */
 @Entity
-@Table(name = "chat_messages")
+@Table(name = "BSG_CHAT_MESSAGE")
 public class ChatMessage {
 
     /** 自增主键 */
@@ -31,10 +31,9 @@ public class ChatMessage {
     @Column(nullable = false)
     private LocalDateTime timestamp;
 
-    /** 所属会话（多对一） */
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "conversation_id", nullable = false)
-    private Conversation conversation;
+    /** 所属会话ID（外键） */
+    @Column(name = "conversation_id", nullable = false)
+    private String conversationId;
 
     public ChatMessage() {
         this.timestamp = LocalDateTime.now();
@@ -44,6 +43,14 @@ public class ChatMessage {
         this.role = role;
         this.content = content;
         this.model = model;
+        this.timestamp = LocalDateTime.now();
+    }
+
+    public ChatMessage(String role, String content, String model, String conversationId) {
+        this.role = role;
+        this.content = content;
+        this.model = model;
+        this.conversationId = conversationId;
         this.timestamp = LocalDateTime.now();
     }
 
@@ -89,11 +96,11 @@ public class ChatMessage {
         this.timestamp = timestamp;
     }
 
-    public Conversation getConversation() {
-        return conversation;
+    public String getConversationId() {
+        return conversationId;
     }
 
-    public void setConversation(Conversation conversation) {
-        this.conversation = conversation;
+    public void setConversationId(String conversationId) {
+        this.conversationId = conversationId;
     }
 }

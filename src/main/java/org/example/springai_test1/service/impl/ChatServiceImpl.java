@@ -2,9 +2,12 @@ package org.example.springai_test1.service.impl;
 
 import jakarta.annotation.Resource;
 import org.example.springai_test1.model.ChatMessage;
+import org.example.springai_test1.model.ChatMessageHis;
 import org.example.springai_test1.model.Conversation;
 import org.example.springai_test1.repository.ConversationRepository;
 import org.example.springai_test1.service.ChatService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
@@ -30,6 +33,8 @@ import java.util.UUID;
 @Transactional
 public class ChatServiceImpl implements ChatService {
 
+    private static final Logger logger = LoggerFactory.getLogger(ChatServiceImpl.class);
+
     @Resource(name = "openAiChatClient")
     private ChatClient openAiChatClient;
 
@@ -39,29 +44,45 @@ public class ChatServiceImpl implements ChatService {
     @Resource(name = "qwenChatClient")
     private ChatClient qwenChatClient;
 
+    @Resource(name = "teacherChatClient")
+    private ChatClient teacherChatClient;
+
     @Autowired
     private ConversationRepository conversationRepository;
 
     @Override
     public String chat(String model, String conversationId, String userMessage) {
+        logger.info("收到聊天请求 - 模型: {}, 会话ID: {}, 用户消息: {}", model, conversationId, userMessage);
+
         // 1. 获取或创建会话
         final String convId;
         Conversation conversation;
         if (conversationId == null || conversationId.isBlank()) {
             convId = UUID.randomUUID().toString();
             conversation = new Conversation(convId, model);
+            conversationRepository.save(conversation);
+            logger.info("创建新会话 - 会话ID: {}, 模型: {}", convId, model);
         } else {
             convId = conversationId;
             conversation = conversationRepository.findById(convId)
-                    .orElseGet(() -> new Conversation(convId, model));
+                    .orElseGet(() -> {
+                        Conversation newConv = new Conversation(convId, model);
+                        conversationRepository.save(newConv);
+                        logger.info("会话不存在，创建新会话 - 会话ID: {}, 模型: {}", convId, model);
+                        return newConv;
+                    });
         }
 
         // 2. 记录用户消息
-        ChatMessage userMsg = new ChatMessage("user", userMessage, model);
-        conversation.addMessage(userMsg);
+        ChatMessage userMsg = new ChatMessage("user", userMessage, model, convId);
+        conversationRepository.saveMessage(userMsg);
+        // 同时保存到历史表
+        ChatMessageHis userMsgHis = new ChatMessageHis("user", userMessage, model, convId);
+        userMsgHis.setTimestamp(userMsg.getTimestamp());
+        conversationRepository.saveMessageHis(userMsgHis);
 
         // 3. 构建上下文消息列表（用于传递给 AI 模型）
-        List<Message> contextMessages = buildContextMessages(conversation);
+        List<Message> contextMessages = buildContextMessages(convId);
 
         // 4. 调用对应的 AI 模型
         ChatClient chatClient = getChatClient(model);
@@ -74,19 +95,27 @@ public class ChatServiceImpl implements ChatService {
                 .content();
 
         // 5. 记录 AI 回复
-        ChatMessage assistantMsg = new ChatMessage("assistant", aiReply, model);
-        conversation.addMessage(assistantMsg);
+        ChatMessage assistantMsg = new ChatMessage("assistant", aiReply, model, convId);
+        conversationRepository.saveMessage(assistantMsg);
+        // 同时保存到历史表
+        ChatMessageHis assistantMsgHis = new ChatMessageHis("assistant", aiReply, model, convId);
+        assistantMsgHis.setTimestamp(assistantMsg.getTimestamp());
+        conversationRepository.saveMessageHis(assistantMsgHis);
 
-        // 6. 持久化会话
-        conversationRepository.save(conversation);
-
+        logger.info("AI回复完成 - 会话ID: {}, 模型: {}, 回复长度: {}", convId, model, aiReply.length());
         return aiReply;
     }
 
     @Override
     public Conversation getConversation(String conversationId) {
-        return conversationRepository.findById(conversationId)
+        Conversation conversation = conversationRepository.findById(conversationId)
                 .orElseThrow(() -> new IllegalArgumentException("会话不存在: " + conversationId));
+        // 手动加载消息
+        List<ChatMessage> messages = conversationRepository.findMessagesByConversationId(conversationId);
+        // 注意：Conversation实体不再有messages字段，这里需要特殊处理
+        // 由于DTO层已经处理了消息组装，这里可以返回不带消息的Conversation
+        // 或者创建一个包含消息的DTO
+        return conversation;
     }
 
     @Override
@@ -101,25 +130,28 @@ public class ChatServiceImpl implements ChatService {
 
     @Override
     public void clearConversation(String conversationId) {
-        Conversation conversation = conversationRepository.findById(conversationId)
+        conversationRepository.findById(conversationId)
                 .orElseThrow(() -> new IllegalArgumentException("会话不存在: " + conversationId));
-        conversation.clearMessages();
-        conversationRepository.save(conversation);
+        conversationRepository.clearMessages(conversationId);
+        logger.info("清除对话消息 - 会话ID: {}", conversationId);
     }
 
     @Override
     public void deleteConversation(String conversationId) {
         conversationRepository.deleteById(conversationId);
+        logger.info("删除对话 - 会话ID: {}", conversationId);
     }
 
     @Override
     public void clearModelConversations(String model) {
         conversationRepository.deleteByModel(model);
+        logger.info("清除模型所有对话 - 模型: {}", model);
     }
 
     @Override
     public void clearAll() {
         conversationRepository.deleteAll();
+        logger.info("清除所有对话");
     }
 
     // ==================== 私有辅助方法 ====================
@@ -132,8 +164,9 @@ public class ChatServiceImpl implements ChatService {
             case "openai" -> openAiChatClient;
             case "deepseek" -> deepSeekChatClient;
             case "qwen" -> qwenChatClient;
+            case "teacher" -> teacherChatClient;
             default -> throw new IllegalArgumentException("不支持的模型: " + model
-                    + "，支持的模型: openai, deepseek, qwen");
+                    + "，支持的模型: openai, deepseek, qwen, teacher");
         };
     }
 
@@ -141,9 +174,10 @@ public class ChatServiceImpl implements ChatService {
      * 从会话历史构建 Spring AI 的 Message 列表（上下文）
      * 将 ChatMessage 转换为 Spring AI 的 Message 接口实现
      */
-    private List<Message> buildContextMessages(Conversation conversation) {
+    private List<Message> buildContextMessages(String conversationId) {
         List<Message> messages = new ArrayList<>();
-        for (ChatMessage msg : conversation.getMessages()) {
+        List<ChatMessage> chatMessages = conversationRepository.findMessagesByConversationId(conversationId);
+        for (ChatMessage msg : chatMessages) {
             switch (msg.getRole()) {
                 case "user" -> messages.add(new UserMessage(msg.getContent()));
                 case "assistant" -> messages.add(new AssistantMessage(msg.getContent()));
