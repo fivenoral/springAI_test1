@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
-    <!-- 日志输出到F:/project/log目录 -->
     <property name="LOG_PATH" value="F:/project/log"/>
     <property name="LOG_FILE" value="springai-chat"/>
 
@@ -12,67 +11,61 @@
         </encoder>
     </appender>
 
-    <!-- 文件输出 - 所有日志 -->
+    <!-- 文件输出 - 所有日志（修掉 Warning 的核心改动） -->
     <appender name="FILE_ALL" class="ch.qos.logback.core.rolling.RollingFileAppender">
         <file>${LOG_PATH}/${LOG_FILE}.log</file>
         <encoder>
             <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
             <charset>UTF-8</charset>
         </encoder>
-        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <!-- fileNamePattern 保持不变 -->
             <fileNamePattern>${LOG_PATH}/${LOG_FILE}.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
-            <timeBasedFileNamingAndTriggeringPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
-                <maxFileSize>100MB</maxFileSize>
-            </timeBasedFileNamingAndTriggeringPolicy>
+            <!-- 关键：把原来的 timeBasedFileNamingAndTriggeringPolicy 整个删掉，换成下面这一行 -->
+            <maxFileSize>100MB</maxFileSize>
             <maxHistory>30</maxHistory>
         </rollingPolicy>
     </appender>
 
-    <!-- 文件输出 - AI调用日志 -->
+    <!-- 文件输出 - AI 调用日志（同样修改） -->
     <appender name="FILE_AI" class="ch.qos.logback.core.rolling.RollingFileAppender">
         <file>${LOG_PATH}/${LOG_FILE}-ai.log</file>
         <encoder>
             <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
             <charset>UTF-8</charset>
         </encoder>
-        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
             <fileNamePattern>${LOG_PATH}/${LOG_FILE}-ai.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
-            <timeBasedFileNamingAndTriggeringPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
-                <maxFileSize>100MB</maxFileSize>
-            </timeBasedFileNamingAndTriggeringPolicy>
+            <maxFileSize>100MB</maxFileSize>
             <maxHistory>30</maxHistory>
         </rollingPolicy>
     </appender>
 
-    <!-- 文件输出 - 业务日志 -->
+    <!-- 文件输出 - 业务日志（同样修改） -->
     <appender name="FILE_BUSINESS" class="ch.qos.logback.core.rolling.RollingFileAppender">
         <file>${LOG_PATH}/${LOG_FILE}-business.log</file>
         <encoder>
             <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
             <charset>UTF-8</charset>
         </encoder>
-        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
             <fileNamePattern>${LOG_PATH}/${LOG_FILE}-business.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
-            <timeBasedFileNamingAndTriggeringPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
-                <maxFileSize>100MB</maxFileSize>
-            </timeBasedFileNamingAndTriggeringPolicy>
+            <maxFileSize>100MB</maxFileSize>
             <maxHistory>30</maxHistory>
         </rollingPolicy>
     </appender>
 
-    <!-- Spring AI 日志级别 -->
+    <!-- 以下 logger 和 root 配置保持不变 -->
     <logger name="org.springframework.ai" level="INFO" additivity="false">
         <appender-ref ref="FILE_AI"/>
         <appender-ref ref="CONSOLE"/>
     </logger>
 
-    <!-- 业务日志级别 -->
     <logger name="org.example.springai_test1" level="INFO" additivity="false">
         <appender-ref ref="FILE_BUSINESS"/>
         <appender-ref ref="CONSOLE"/>
     </logger>
 
-    <!-- 根日志级别 -->
     <root level="INFO">
         <appender-ref ref="FILE_ALL"/>
         <appender-ref ref="CONSOLE"/>
