@@ -12,10 +12,13 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.content.Media;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.MimeTypeUtils;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -46,6 +49,9 @@ public class ChatServiceImpl implements ChatService {
 
     @Resource(name = "teacherChatClient")
     private ChatClient teacherChatClient;
+
+    @Resource(name = "qwenVisionChatClient")
+    private ChatClient qwenVisionChatClient;
 
     @Autowired
     private ConversationRepository conversationRepository;
@@ -108,6 +114,66 @@ public class ChatServiceImpl implements ChatService {
     }
 
     @Override
+    public String chatWithImage(String model, String conversationId, String userMessage, String imageUrl) {
+        logger.info("收到图片聊天请求 - 模型: {}, 会话ID: {}, 用户消息: {}, 图片URL: {}", model, conversationId, userMessage, imageUrl);
+
+        // 1. 获取或创建会话
+        final String convId;
+        Conversation conversation;
+        if (conversationId == null || conversationId.isBlank()) {
+            convId = UUID.randomUUID().toString();
+            conversation = new Conversation(convId, model);
+            conversationRepository.save(conversation);
+            logger.info("创建新会话 - 会话ID: {}, 模型: {}", convId, model);
+        } else {
+            convId = conversationId;
+            conversation = conversationRepository.findById(convId)
+                    .orElseGet(() -> {
+                        Conversation newConv = new Conversation(convId, model);
+                        conversationRepository.save(newConv);
+                        logger.info("会话不存在，创建新会话 - 会话ID: {}, 模型: {}", convId, model);
+                        return newConv;
+                    });
+        }
+
+        // 2. 记录用户消息（含图片URL）
+        ChatMessage userMsg = new ChatMessage("user", userMessage, model, convId);
+        userMsg.setImageUrl(imageUrl);
+        conversationRepository.saveMessage(userMsg);
+        ChatMessageHis userMsgHis = new ChatMessageHis("user", userMessage, model, convId);
+        userMsgHis.setTimestamp(userMsg.getTimestamp());
+        userMsgHis.setImageUrl(imageUrl);
+        conversationRepository.saveMessageHis(userMsgHis);
+
+        // 3. 调用视觉模型（带图片的多模态请求）
+        ChatClient chatClient = getChatClient(model);
+        String aiReply = chatClient.prompt()
+                .user(u -> {
+                    u.text(userMessage != null && !userMessage.isBlank() ? userMessage : "请描述这张图片");
+                    if (imageUrl != null && !imageUrl.isBlank()) {
+                        try {
+                            Media imageMedia = new Media(MimeTypeUtils.IMAGE_PNG, new URI(imageUrl));
+                            u.media(imageMedia);
+                        } catch (Exception e) {
+                            logger.error("图片URL转换失败: {}", imageUrl, e);
+                        }
+                    }
+                })
+                .call()
+                .content();
+
+        // 4. 记录 AI 回复
+        ChatMessage assistantMsg = new ChatMessage("assistant", aiReply, model, convId);
+        conversationRepository.saveMessage(assistantMsg);
+        ChatMessageHis assistantMsgHis = new ChatMessageHis("assistant", aiReply, model, convId);
+        assistantMsgHis.setTimestamp(assistantMsg.getTimestamp());
+        conversationRepository.saveMessageHis(assistantMsgHis);
+
+        logger.info("图片AI回复完成 - 会话ID: {}, 模型: {}, 回复长度: {}", convId, model, aiReply.length());
+        return aiReply;
+    }
+
+    @Override
     public Conversation getConversation(String conversationId) {
         Conversation conversation = conversationRepository.findById(conversationId)
                 .orElseThrow(() -> new IllegalArgumentException("会话不存在: " + conversationId));
@@ -166,8 +232,9 @@ public class ChatServiceImpl implements ChatService {
             case "deepseek" -> deepSeekChatClient;
             case "qwen" -> qwenChatClient;
             case "teacher" -> teacherChatClient;
+            case "qwen-vision" -> qwenVisionChatClient;
             default -> throw new IllegalArgumentException("不支持的模型: " + model
-                    + "，支持的模型: openai, deepseek, qwen, teacher");
+                    + "，支持的模型: openai, deepseek, qwen, teacher, qwen-vision");
         };
     }
 

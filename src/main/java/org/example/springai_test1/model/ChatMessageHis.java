@@ -36,6 +36,10 @@ public class ChatMessageHis {
     @Column(name = "conversation_id", nullable = false)
     private String conversationId;
 
+    /** 图片URL（可选，用于视觉模型） */
+    @Column(name = "image_url")
+    private String imageUrl;
+
     /** 有效标识：1-有效，0-无效 */
     @Column(name = "valid_flag", nullable = false)
     private Integer validFlag;
@@ -136,5 +140,13 @@ public class ChatMessageHis {
 
     public void setUpdateTime(LocalDateTime updateTime) {
         this.updateTime = updateTime;
+    }
+
+    public String getImageUrl() {
+        return imageUrl;
+    }
+
+    public void setImageUrl(String imageUrl) {
+        this.imageUrl = imageUrl;
     }
 }

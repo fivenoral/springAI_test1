@@ -63,6 +63,25 @@
         .chat-input button:hover { background: #1565c0; }
         .chat-input button:disabled { background: #ccc; cursor: not-allowed; }
 
+        /* 图片上传区域 */
+        .image-upload-area { display: none; padding: 8px 20px; background: #fff; border-top: 1px solid #e0e0e0; }
+        .image-upload-area.active { display: flex; align-items: center; gap: 10px; }
+        .image-preview { position: relative; max-width: 120px; max-height: 80px; border-radius: 8px; overflow: hidden; border: 1px solid #ddd; }
+        .image-preview img { max-width: 100%; max-height: 80px; object-fit: cover; }
+        .image-preview .remove-image { position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; background: rgba(0,0,0,0.6); color: #fff; border: none; border-radius: 50%; cursor: pointer; font-size: 12px; line-height: 20px; text-align: center; }
+        .image-upload-btn { padding: 8px 12px; border: 2px dashed #ccc; border-radius: 8px; background: #fafafa; cursor: pointer; color: #888; font-size: 13px; }
+        .image-upload-btn:hover { border-color: #1976d2; color: #1976d2; background: #e3f2fd; }
+        #imageFileInput { display: none; }
+
+        /* 消息中的图片 */
+        .message .bubble img { max-width: 200px; max-height: 150px; border-radius: 8px; margin-bottom: 6px; display: block; cursor: pointer; }
+        .message .bubble img:hover { opacity: 0.9; }
+
+        /* 图片放大弹窗 */
+        .image-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; justify-content: center; align-items: center; cursor: pointer; }
+        .image-overlay.active { display: flex; }
+        .image-overlay img { max-width: 90vw; max-height: 90vh; border-radius: 8px; }
+
         /* 加载动画 */
         .typing-indicator { display: inline-flex; gap: 4px; padding: 8px 12px; }
         .typing-indicator span { width: 8px; height: 8px; background: #999; border-radius: 50%; animation: bounce 1.4s infinite; }
@@ -74,6 +93,7 @@
         .model-openai { color: #10a37f; }
         .model-deepseek { color: #1976d2; }
         .model-qwen { color: #ff6f00; }
+        .model-qwen-vision { color: #9c27b0; }
         .model-teacher { color: #e91e63; }
     </style>
 </head>
@@ -95,6 +115,7 @@
                     <option value="openai">OpenAI (GPT-4o)</option>
                     <option value="deepseek">DeepSeek</option>
                     <option value="qwen">通义千问 (Qwen)</option>
+                    <option value="qwen-vision">千问视觉 (图片理解)</option>
                     <option value="teacher">温柔老师</option>
                 </select>
                 <button onclick="newConversation()">+ 新建对话</button>
@@ -110,11 +131,24 @@
                     <p>选择模型，开始对话</p>
                 </div>
             </div>
+            <div class="image-upload-area" id="imageUploadArea">
+                <div class="image-preview" id="imagePreview"></div>
+                <label class="image-upload-btn" onclick="document.getElementById('imageFileInput').click()">
+                    + 选择图片
+                </label>
+                <input type="file" id="imageFileInput" accept="image/*" onchange="onImageSelected(event)">
+            </div>
             <div class="chat-input">
+                <button id="imageBtn" onclick="toggleImageUpload()" title="上传图片" style="padding: 10px 12px; background: #fff; color: #1976d2; border: 1px solid #1976d2; border-radius: 8px; cursor: pointer; font-size: 16px;">🖼</button>
                 <textarea id="messageInput" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1" onkeydown="handleKeyDown(event)"></textarea>
                 <button id="sendBtn" onclick="sendMessage()">发送</button>
             </div>
         </div>
+    </div>
+
+    <!-- 图片放大弹窗 -->
+    <div class="image-overlay" id="imageOverlay" onclick="this.classList.remove('active')">
+        <img id="overlayImage" src="" alt="放大图片">
     </div>
 
     <script>
@@ -122,6 +156,7 @@
         let currentModel = 'openai';
         let currentConversationId = null;
         let conversations = [];
+        let selectedImageFile = null;  // 当前选中的图片文件
 
         // ==================== 初始化 ====================
         document.addEventListener('DOMContentLoaded', () => {
@@ -224,7 +259,9 @@
         async function sendMessage() {
             const input = document.getElementById('messageInput');
             const message = input.value.trim();
-            if (!message) return;
+            const hasImage = selectedImageFile !== null;
+
+            if (!message && !hasImage) return;
 
             const sendBtn = document.getElementById('sendBtn');
             sendBtn.disabled = true;
@@ -234,18 +271,39 @@
             const emptyState = document.getElementById('emptyState');
             if (emptyState) emptyState.remove();
 
-            // 显示用户消息
-            appendMessage('user', message);
+            // 显示用户消息（含图片）
+            const imageUrl = hasImage ? URL.createObjectURL(selectedImageFile) : null;
+            appendMessage('user', message || '（图片）', imageUrl);
 
             // 显示加载动画
             const loadingId = showTypingIndicator();
 
             try {
-                const result = await apiCall('/api/chat/send', 'POST', {
-                    model: currentModel,
-                    conversationId: currentConversationId,
-                    message: message
-                });
+                let result;
+                if (hasImage) {
+                    // 使用 multipart/form-data 发送图片
+                    const formData = new FormData();
+                    formData.append('model', currentModel);
+                    if (currentConversationId) formData.append('conversationId', currentConversationId);
+                    formData.append('message', message || '请描述这张图片');
+                    formData.append('image', selectedImageFile);
+
+                    const res = await fetch('/api/chat/send-with-image', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    if (!res.ok) {
+                        const errData = await res.json().catch(() => ({ error: 'HTTP ' + res.status }));
+                        throw new Error(errData.error || 'HTTP ' + res.status);
+                    }
+                    result = await res.json();
+                } else {
+                    result = await apiCall('/api/chat/send', 'POST', {
+                        model: currentModel,
+                        conversationId: currentConversationId,
+                        message: message
+                    });
+                }
 
                 // 移除加载动画
                 removeTypingIndicator(loadingId);
@@ -266,6 +324,8 @@
                 appendMessage('assistant', '请求失败: ' + error.message);
             }
 
+            // 清除图片状态
+            clearImageSelection();
             sendBtn.disabled = false;
             input.focus();
         }
@@ -282,17 +342,18 @@
                     </div>`;
                 return;
             }
-            messages.forEach(msg => appendMessage(msg.role, msg.content));
+            messages.forEach(msg => appendMessage(msg.role, msg.content, msg.imageUrl));
         }
 
-        function appendMessage(role, content) {
+        function appendMessage(role, content, imageUrl) {
             const container = document.getElementById('chatMessages');
             const avatar = role === 'user' ? '你' : 'AI';
             const div = document.createElement('div');
             div.className = 'message ' + role;
+            const imgHtml = imageUrl ? `<img src="${imageUrl}" alt="图片" onclick="showFullImage('${imageUrl}')">` : '';
             div.innerHTML = `
                 <div class="avatar">${avatar}</div>
-                <div class="bubble">${escapeHtml(content)}</div>`;
+                <div class="bubble">${imgHtml}${escapeHtml(content)}</div>`;
             container.appendChild(div);
             container.scrollTop = container.scrollHeight;
         }
@@ -333,7 +394,7 @@
 
         // ==================== 工具函数 ====================
         function getModelLabel(model) {
-            const labels = { openai: 'OpenAI', deepseek: 'DeepSeek', qwen: '通义千问', teacher: '温柔老师' };
+            const labels = { openai: 'OpenAI', deepseek: 'DeepSeek', qwen: '通义千问', 'qwen-vision': '千问视觉', teacher: '温柔老师' };
             return labels[model] || model;
         }
 
@@ -355,6 +416,51 @@
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        }
+
+        // ==================== 图片处理 ====================
+        function toggleImageUpload() {
+            const area = document.getElementById('imageUploadArea');
+            area.classList.toggle('active');
+        }
+
+        function onImageSelected(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            if (!file.type.startsWith('image/')) {
+                alert('请选择图片文件');
+                return;
+            }
+            if (file.size > 10 * 1024 * 1024) {
+                alert('图片大小不能超过 10MB');
+                return;
+            }
+            selectedImageFile = file;
+            // 显示预览
+            const preview = document.getElementById('imagePreview');
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                preview.innerHTML = `
+                    <img src="${e.target.result}" alt="预览">
+                    <button class="remove-image" onclick="clearImageSelection()">✕</button>`;
+            };
+            reader.readAsDataURL(file);
+            // 确保上传区域可见
+            document.getElementById('imageUploadArea').classList.add('active');
+        }
+
+        function clearImageSelection() {
+            selectedImageFile = null;
+            const preview = document.getElementById('imagePreview');
+            preview.innerHTML = '';
+            document.getElementById('imageFileInput').value = '';
+            document.getElementById('imageUploadArea').classList.remove('active');
+        }
+
+        function showFullImage(url) {
+            const overlay = document.getElementById('imageOverlay');
+            document.getElementById('overlayImage').src = url;
+            overlay.classList.add('active');
         }
     </script>
 </body>

@@ -47,6 +47,9 @@ public class ChatClientConfig {
     @Value("${spring.ai.qwen.chat.options.model:qwen-plus}")
     private String qwenModel;
 
+    @Value("${spring.ai.qwen.vision.model:qwen-vl-max-latest}")
+    private String qwenVisionModel;
+
     /**
      * OpenAI ChatClient
      * 使用自动注入的 OpenAiChatModel（由 spring-ai-starter-model-openai 自动配置）
@@ -120,6 +123,33 @@ public class ChatClientConfig {
         return ChatClient.builder(chatModel)
                 .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor)
                 .defaultTools(allToolCallbacks)
+                .build();
+    }
+
+    /**
+     * 通义千问视觉（Qwen Vision）ChatClient
+     * 使用 Qwen VL 模型，支持图片理解（多模态输入）。
+     * 不配置 ReReadingAdvisor，因为多模态消息与消息增强不兼容。
+     */
+    @Bean(name = "qwenVisionChatClient")
+    public ChatClient qwenVisionChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor) {
+        OpenAIClient qwenVisionClient = OpenAiSetup.setupSyncClient(
+                qwenBaseUrl, qwenApiKey, null, null, null, null,
+                false, false, qwenVisionModel, Duration.ofSeconds(120), 0, null, null);
+        OpenAIClientAsync qwenVisionClientAsync = OpenAiSetup.setupAsyncClient(
+                qwenBaseUrl, qwenApiKey, null, null, null, null,
+                false, false, qwenVisionModel, Duration.ofSeconds(120), 0, null, null);
+
+        OpenAiChatModel chatModel = OpenAiChatModel.builder()
+                .openAiClient(qwenVisionClient)
+                .openAiClientAsync(qwenVisionClientAsync)
+                .options(OpenAiChatOptions.builder()
+                        .model(qwenVisionModel)
+                        .build())
+                .build();
+
+        return ChatClient.builder(chatModel)
+                .defaultAdvisors(simpleLoggerAdvisor)
                 .build();
     }
 

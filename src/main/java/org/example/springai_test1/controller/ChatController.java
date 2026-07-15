@@ -7,11 +7,19 @@ import org.example.springai_test1.service.ChatService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 /**
@@ -24,6 +32,9 @@ import java.util.stream.Collectors;
 public class ChatController {
 
     private static final Logger logger = LoggerFactory.getLogger(ChatController.class);
+
+    @Value("${app.upload.dir:uploads}")
+    private String uploadDir;
 
     @Autowired
     private ChatService chatService;
@@ -140,6 +151,90 @@ public class ChatController {
         return ResponseEntity.ok(Map.of("message", "所有对话已清除"));
     }
 
+    // ==================== 图片处理接口 ====================
+
+    /**
+     * 上传图片并发送到视觉模型获取AI回复
+     * POST /api/chat/send-with-image
+     * Content-Type: multipart/form-data
+     * Parameters: model, conversationId, message, image (file)
+     */
+    @PostMapping(value = "/send-with-image", consumes = "multipart/form-data")
+    public ResponseEntity<Map<String, String>> sendMessageWithImage(
+            @RequestParam(value = "model", defaultValue = "qwen-vision") String model,
+            @RequestParam(value = "conversationId", required = false) String conversationId,
+            @RequestParam(value = "message", required = false) String message,
+            @RequestParam("image") MultipartFile image) {
+
+        logger.info("API调用 - 发送图片消息: 模型={}, 会话ID={}, 消息={}, 文件名={}, 大小={}",
+                model, conversationId, message, image.getOriginalFilename(), image.getSize());
+
+        if (image.isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "图片不能为空"));
+        }
+
+        try {
+            // 保存图片文件
+            String imageUrl = saveImage(image);
+            logger.info("图片已保存, URL: {}", imageUrl);
+
+            // 调用视觉模型
+            String reply = chatService.chatWithImage(model, conversationId,
+                    message != null ? message : "请描述这张图片", imageUrl);
+
+            return ResponseEntity.ok(Map.of("reply", reply, "model", model, "imageUrl", imageUrl));
+        } catch (IOException e) {
+            logger.error("图片保存失败", e);
+            return ResponseEntity.internalServerError().body(Map.of("error", "图片保存失败: " + e.getMessage()));
+        } catch (Exception e) {
+            logger.error("视觉模型调用失败", e);
+            return ResponseEntity.internalServerError().body(Map.of("error", "AI处理失败: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * 上传图片（仅上传，不发送消息）
+     * POST /api/chat/upload-image
+     */
+    @PostMapping(value = "/upload-image", consumes = "multipart/form-data")
+    public ResponseEntity<Map<String, String>> uploadImage(@RequestParam("image") MultipartFile image) {
+        if (image.isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "图片不能为空"));
+        }
+        try {
+            String imageUrl = saveImage(image);
+            return ResponseEntity.ok(Map.of("imageUrl", imageUrl));
+        } catch (IOException e) {
+            logger.error("图片上传失败", e);
+            return ResponseEntity.internalServerError().body(Map.of("error", "图片上传失败: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * 保存图片文件并返回可访问的URL
+     */
+    private String saveImage(MultipartFile image) throws IOException {
+        // 确保上传目录存在
+        Path uploadPath = Paths.get(uploadDir).toAbsolutePath();
+        Files.createDirectories(uploadPath);
+
+        // 生成唯一文件名
+        String originalFilename = image.getOriginalFilename();
+        String extension = "";
+        if (originalFilename != null && originalFilename.contains(".")) {
+            extension = originalFilename.substring(originalFilename.lastIndexOf("."));
+        }
+        String filename = UUID.randomUUID().toString() + extension;
+
+        // 保存文件
+        Path filePath = uploadPath.resolve(filename);
+        image.transferTo(filePath.toFile());
+        logger.info("图片保存到: {}", filePath);
+
+        // 返回可访问的URL（通过静态资源映射）
+        return "/uploads/" + filename;
+    }
+
     // ==================== Entity到DTO转换方法 ====================
 
     private ConversationDTO toDTOWithMessages(String conversationId, Conversation conversation) {
@@ -166,6 +261,7 @@ public class ChatController {
                 message.getRole(),
                 message.getContent(),
                 message.getModel(),
+                message.getImageUrl(),
                 message.getTimestamp()
         );
     }

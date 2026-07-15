@@ -31,6 +31,10 @@ public class ChatMessage {
     @Column(nullable = false)
     private LocalDateTime timestamp;
 
+    /** 图片URL（可选，用于视觉模型） */
+    @Column(name = "image_url")
+    private String imageUrl;
+
     /** 所属会话ID（外键） */
     @Column(name = "conversation_id", nullable = false)
     private String conversationId;
@@ -102,5 +106,13 @@ public class ChatMessage {
 
     public void setConversationId(String conversationId) {
         this.conversationId = conversationId;
+    }
+
+    public String getImageUrl() {
+        return imageUrl;
+    }
+
+    public void setImageUrl(String imageUrl) {
+        this.imageUrl = imageUrl;
     }
 }
