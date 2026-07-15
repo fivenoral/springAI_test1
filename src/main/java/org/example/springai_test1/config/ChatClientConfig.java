@@ -2,6 +2,7 @@ package org.example.springai_test1.config;
 
 import com.openai.client.OpenAIClient;
 import com.openai.client.OpenAIClientAsync;
+import org.example.springai_test1.advisor.ReReadingAdvisor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor;
 import org.springframework.ai.openai.OpenAiChatModel;
@@ -24,17 +25,9 @@ import java.time.Duration;
 @Configuration
 public class ChatClientConfig {
 
-    /**
-     * SimpleLoggerAdvisor - 自动记录AI调用日志
-     */
-    @Bean
-    public SimpleLoggerAdvisor simpleLoggerAdvisor() {
-        return new SimpleLoggerAdvisor();
-    }
-
     // ==================== DeepSeek 配置 ====================
 
-    @Value("${spring.ai.deepseek.base-url:https://api.deepseek.com}")
+    @Value("${spring.ai.deepseek.base-url:https://aigw.telecomjs.com/v1}")
     private String deepSeekBaseUrl;
 
     @Value("${spring.ai.deepseek.api-key:}")
@@ -59,9 +52,13 @@ public class ChatClientConfig {
      * 使用自动注入的 OpenAiChatModel（由 spring-ai-starter-model-openai 自动配置）
      */
     @Bean(name = "openAiChatClient")
-    public ChatClient openAiChatClient(OpenAiChatModel openAiChatModel, SimpleLoggerAdvisor simpleLoggerAdvisor) {
+    public ChatClient openAiChatClient(OpenAiChatModel openAiChatModel, 
+                                       SimpleLoggerAdvisor simpleLoggerAdvisor,
+                                       ReReadingAdvisor reReadingAdvisor,
+                                       Object[] allToolCallbacks) {
         return ChatClient.builder(openAiChatModel)
-                .defaultAdvisors(simpleLoggerAdvisor)
+                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor)
+                .defaultTools(allToolCallbacks)
                 .build();
     }
 
@@ -71,7 +68,9 @@ public class ChatClientConfig {
      * 手动构建独立的 OpenAiChatModel 实例，避免与 OpenAI 的自动配置冲突。
      */
     @Bean(name = "deepSeekChatClient")
-    public ChatClient deepSeekChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor) {
+    public ChatClient deepSeekChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor,
+                                         ReReadingAdvisor reReadingAdvisor,
+                                         Object[] allToolCallbacks) {
         OpenAIClient deepSeekClient = OpenAiSetup.setupSyncClient(
                 deepSeekBaseUrl, deepSeekApiKey, null, null, null, null,
                 false, false, deepSeekModel, Duration.ofSeconds(60), 0, null, null);
@@ -90,7 +89,8 @@ public class ChatClientConfig {
 
         return ChatClient.builder(chatModel)
                 /*.defaultSystem("You are a helpful assistant.")*/   //系统元数据
-                .defaultAdvisors(simpleLoggerAdvisor)
+                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor)
+                .defaultTools(allToolCallbacks)
                 .build();
     }
 
@@ -99,7 +99,9 @@ public class ChatClientConfig {
      * 通过 DashScope 的 OpenAI 兼容接口接入，使用 OpenAiSetup 创建客户端。
      */
     @Bean(name = "qwenChatClient")
-    public ChatClient qwenChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor) {
+    public ChatClient qwenChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor,
+                                     ReReadingAdvisor reReadingAdvisor,
+                                     Object[] allToolCallbacks) {
         OpenAIClient qwenClient = OpenAiSetup.setupSyncClient(
                 qwenBaseUrl, qwenApiKey, null, null, null, null,
                 false, false, qwenModel, Duration.ofSeconds(60), 0, null, null);
@@ -116,7 +118,8 @@ public class ChatClientConfig {
                 .build();
 
         return ChatClient.builder(chatModel)
-                .defaultAdvisors(simpleLoggerAdvisor)
+                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor)
+                .defaultTools(allToolCallbacks)
                 .build();
     }
 
@@ -125,7 +128,9 @@ public class ChatClientConfig {
      * 基于DeepSeek模型，通过系统提示词让AI以温柔老师的风格说话
      */
     @Bean(name = "teacherChatClient")
-    public ChatClient teacherChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor) {
+    public ChatClient teacherChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor,
+                                        ReReadingAdvisor reReadingAdvisor,
+                                        Object[] allToolCallbacks) {
         OpenAIClient deepSeekClient = OpenAiSetup.setupSyncClient(
                 qwenBaseUrl, qwenApiKey, null, null, null, null,
                 false, false, qwenModel, Duration.ofSeconds(60), 0, null, null);
@@ -148,7 +153,8 @@ public class ChatClientConfig {
                         "Be supportive, positive, and nurturing. Make learning feel comfortable and enjoyable. " +
                         "When explaining concepts, break them down clearly and gently. Celebrate progress and " +
                         "offer constructive feedback with compassion.")
-                .defaultAdvisors(simpleLoggerAdvisor)
+                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor)
+                .defaultTools(allToolCallbacks)
                 .build();
     }
 }

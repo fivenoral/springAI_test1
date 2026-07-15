@@ -1,7 +1,6 @@
 package org.example.springai_test1.service.impl;
 
 import jakarta.annotation.Resource;
-import org.example.springai_test1.advisor.ReReadingUtils;
 import org.example.springai_test1.model.ChatMessage;
 import org.example.springai_test1.model.ChatMessageHis;
 import org.example.springai_test1.model.Conversation;
@@ -85,17 +84,14 @@ public class ChatServiceImpl implements ChatService {
         // 3. 构建上下文消息列表（用于传递给 AI 模型）
         List<Message> contextMessages = buildContextMessages(convId);
 
-        // 4. 对用户消息应用重读提示，提升推理能力
-        String enhancedUserMessage = ReReadingUtils.enhanceUserMessage(userMessage);
-
-        // 5. 调用对应的 AI 模型
+        // 4. 调用对应的 AI 模型（ReReadingAdvisor 会自动处理消息增强）
         ChatClient chatClient = getChatClient(model);
         String aiReply = chatClient.prompt()
                 /*.system(s -> s.text("You are a helpful assistant."))*/     //系统元数据
                 /*.user(u -> u.text("What's the weather like?")
                         .metadata("messageId", "msg-123"))*/     //用户元数据
                 .messages(contextMessages)
-                .user(enhancedUserMessage)
+                .user(u->u.text(userMessage)/*.media()  // 通过该方法使输入包含图片音频等*/)
                 .call()
                 .content();
 
