@@ -22,15 +22,25 @@ public interface ChatService {
     String chat(String model, String conversationId, String userMessage);
 
     /**
-     * 发送带图片的消息并获取 AI 回复（视觉模型）
+     * 生成图片并保存到本地
      *
-     * @param model          模型标识：qwen-vision
+     * @param prompt         图片生成提示词
      * @param conversationId 会话ID（为空则自动创建新会话）
-     * @param userMessage    用户消息内容
-     * @param imageUrl       图片URL
-     * @return AI 回复内容
+     * @param size           图片尺寸，如 "1024*1024"、"720*1280"、"1280*720"
+     * @return 生成的图片URL
      */
-    String chatWithImage(String model, String conversationId, String userMessage, String imageUrl);
+    String generateImage(String prompt, String conversationId, String size);
+
+    /**
+     * 编辑图片并保存到本地
+     *
+     * @param prompt         图片编辑提示词
+     * @param conversationId 会话ID（为空则自动创建新会话）
+     * @param imageData      原始图片字节数据
+     * @param imageUrl       原始图片URL（用于存储）
+     * @return 编辑后的图片URL
+     */
+    String editImage(String prompt, String conversationId, byte[] imageData, String imageUrl);
 
     /**
      * 获取指定会话的完整对话历史

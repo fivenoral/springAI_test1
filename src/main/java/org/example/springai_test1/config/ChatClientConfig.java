@@ -47,8 +47,8 @@ public class ChatClientConfig {
     @Value("${spring.ai.qwen.chat.options.model:qwen-plus}")
     private String qwenModel;
 
-    @Value("${spring.ai.qwen.vision.model:qwen-vl-max-latest}")
-    private String qwenVisionModel;
+    @Value("${spring.ai.qwen.image.model:qwen-image-edit-max}")
+    private String qwenImageModel;
 
     /**
      * OpenAI ChatClient
@@ -127,24 +127,23 @@ public class ChatClientConfig {
     }
 
     /**
-     * 通义千问视觉（Qwen Vision）ChatClient
-     * 使用 Qwen VL 模型，支持图片理解（多模态输入）。
-     * 不配置 ReReadingAdvisor，因为多模态消息与消息增强不兼容。
+     * 通义千问图像生成/编辑（Qwen Image）ChatClient
+     * 使用 qwen-image-edit-max 模型，通过电信网关访问。
      */
-    @Bean(name = "qwenVisionChatClient")
-    public ChatClient qwenVisionChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor) {
-        OpenAIClient qwenVisionClient = OpenAiSetup.setupSyncClient(
+    @Bean(name = "qwenImageChatClient")
+    public ChatClient qwenImageChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor) {
+        OpenAIClient qwenImageClient = OpenAiSetup.setupSyncClient(
                 qwenBaseUrl, qwenApiKey, null, null, null, null,
-                false, false, qwenVisionModel, Duration.ofSeconds(120), 0, null, null);
-        OpenAIClientAsync qwenVisionClientAsync = OpenAiSetup.setupAsyncClient(
+                false, false, qwenImageModel, Duration.ofSeconds(120), 0, null, null);
+        OpenAIClientAsync qwenImageClientAsync = OpenAiSetup.setupAsyncClient(
                 qwenBaseUrl, qwenApiKey, null, null, null, null,
-                false, false, qwenVisionModel, Duration.ofSeconds(120), 0, null, null);
+                false, false, qwenImageModel, Duration.ofSeconds(120), 0, null, null);
 
         OpenAiChatModel chatModel = OpenAiChatModel.builder()
-                .openAiClient(qwenVisionClient)
-                .openAiClientAsync(qwenVisionClientAsync)
+                .openAiClient(qwenImageClient)
+                .openAiClientAsync(qwenImageClientAsync)
                 .options(OpenAiChatOptions.builder()
-                        .model(qwenVisionModel)
+                        .model(qwenImageModel)
                         .build())
                 .build();
 
@@ -153,38 +152,4 @@ public class ChatClientConfig {
                 .build();
     }
 
-    /**
-     * 温柔老师 ChatClient
-     * 基于DeepSeek模型，通过系统提示词让AI以温柔老师的风格说话
-     */
-    @Bean(name = "teacherChatClient")
-    public ChatClient teacherChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor,
-                                        ReReadingAdvisor reReadingAdvisor,
-                                        Object[] allToolCallbacks) {
-        OpenAIClient deepSeekClient = OpenAiSetup.setupSyncClient(
-                qwenBaseUrl, qwenApiKey, null, null, null, null,
-                false, false, qwenModel, Duration.ofSeconds(60), 0, null, null);
-        OpenAIClientAsync deepSeekClientAsync = OpenAiSetup.setupAsyncClient(
-                qwenBaseUrl, qwenApiKey, null, null, null, null,
-                false, false, qwenModel, Duration.ofSeconds(60), 0, null, null);
-
-        OpenAiChatModel chatModel = OpenAiChatModel.builder()
-                .openAiClient(deepSeekClient)
-                .openAiClientAsync(deepSeekClientAsync)
-                .options(OpenAiChatOptions.builder()
-                        .model(qwenModel)
-                        .build())
-                .build();
-
-        return ChatClient.builder(chatModel)
-                .defaultSystem("You are a gentle and caring teacher. You speak with warmth, patience, and encouragement. " +
-                        "Address the student with kindness and understanding. Use phrases like 'Let me explain', " +
-                        "'Don't worry', 'You're doing great', 'Take your time', 'I'm here to help'. " +
-                        "Be supportive, positive, and nurturing. Make learning feel comfortable and enjoyable. " +
-                        "When explaining concepts, break them down clearly and gently. Celebrate progress and " +
-                        "offer constructive feedback with compassion.")
-                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor)
-                .defaultTools(allToolCallbacks)
-                .build();
-    }
 }

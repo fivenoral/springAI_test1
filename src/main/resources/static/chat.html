@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Spring AI 多模型对话</title>
+    <title>Spring AI noral学习用</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; height: 100vh; display: flex; flex-direction: column; }
@@ -93,8 +93,13 @@
         .model-openai { color: #10a37f; }
         .model-deepseek { color: #1976d2; }
         .model-qwen { color: #ff6f00; }
-        .model-qwen-vision { color: #9c27b0; }
-        .model-teacher { color: #e91e63; }
+        .model-qwen-image { color: #7b1fa2; }
+
+        /* 图像生成/编辑按钮 */
+        .image-action-btn { padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; font-size: 13px; }
+        .image-action-btn:hover { background: #f0f0f0; }
+        .image-action-btn.primary { background: #7b1fa2; color: #fff; border-color: #7b1fa2; }
+        .image-action-btn.primary:hover { background: #6a1b9a; }
     </style>
 </head>
 <body>
@@ -115,8 +120,7 @@
                     <option value="openai">OpenAI (GPT-4o)</option>
                     <option value="deepseek">DeepSeek</option>
                     <option value="qwen">通义千问 (Qwen)</option>
-                    <option value="qwen-vision">千问视觉 (图片理解)</option>
-                    <option value="teacher">温柔老师</option>
+                    <option value="qwen-image">千问图像 (生成/编辑)</option>
                 </select>
                 <button onclick="newConversation()">+ 新建对话</button>
             </div>
@@ -139,7 +143,8 @@
                 <input type="file" id="imageFileInput" accept="image/*" onchange="onImageSelected(event)">
             </div>
             <div class="chat-input">
-                <button id="imageBtn" onclick="toggleImageUpload()" title="上传图片" style="padding: 10px 12px; background: #fff; color: #1976d2; border: 1px solid #1976d2; border-radius: 8px; cursor: pointer; font-size: 16px;">🖼</button>
+                <button id="generateImageBtn" onclick="showGenerateImageDialog()" title="生成图片" style="padding: 10px 12px; background: #fff; color: #7b1fa2; border: 1px solid #7b1fa2; border-radius: 8px; cursor: pointer; font-size: 16px;">🎨</button>
+                <button id="uploadImageBtn" onclick="document.getElementById('imageFileInput').click()" title="上传图片进行编辑" style="display: none; padding: 10px 12px; background: #fff; color: #7b1fa2; border: 1px solid #7b1fa2; border-radius: 8px; cursor: pointer; font-size: 16px;">📎</button>
                 <textarea id="messageInput" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1" onkeydown="handleKeyDown(event)"></textarea>
                 <button id="sendBtn" onclick="sendMessage()">发送</button>
             </div>
@@ -149,6 +154,50 @@
     <!-- 图片放大弹窗 -->
     <div class="image-overlay" id="imageOverlay" onclick="this.classList.remove('active')">
         <img id="overlayImage" src="" alt="放大图片">
+    </div>
+
+    <!-- 图像生成弹窗 -->
+    <div class="image-overlay" id="generateImageDialog" onclick="if(event.target === this) hideGenerateImageDialog()">
+        <div style="background: white; padding: 24px; border-radius: 12px; max-width: 500px; width: 90%;">
+            <h3 style="margin-bottom: 16px; font-size: 18px;">生成图片</h3>
+            <textarea id="generatePromptInput" placeholder="描述你想要生成的图片..." rows="4" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 8px; resize: none; font-size: 14px; font-family: inherit;"></textarea>
+            <div style="display: flex; gap: 12px; margin-top: 12px;">
+                <div style="flex: 1;">
+                    <label style="font-size: 13px; color: #666; display: block; margin-bottom: 4px;">图片尺寸</label>
+                    <select id="generateSizeSelect" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px;">
+                        <option value="1024*1024">1024×1024 (正方形)</option>
+                        <option value="720*1280">720×1280 (竖版)</option>
+                        <option value="1280*720">1280×720 (横版)</option>
+                    </select>
+                </div>
+                <div style="flex: 1;">
+                    <label style="font-size: 13px; color: #666; display: block; margin-bottom: 4px;">清晰度</label>
+                    <select id="generateQualitySelect" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px;">
+                        <option value="normal">标准</option>
+                        <option value="high">高清</option>
+                    </select>
+                </div>
+            </div>
+            <div style="display: flex; gap: 10px; margin-top: 16px; justify-content: flex-end;">
+                <button class="image-action-btn" onclick="hideGenerateImageDialog()">取消</button>
+                <button class="image-action-btn primary" onclick="generateImage()">生成</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 图像编辑弹窗 -->
+    <div class="image-overlay" id="editImageDialog" onclick="if(event.target === this) hideEditImageDialog()">
+        <div style="background: white; padding: 24px; border-radius: 12px; max-width: 500px; width: 90%;">
+            <h3 style="margin-bottom: 16px; font-size: 18px;">编辑图片</h3>
+            <div id="editImagePreview" style="margin-bottom: 16px; text-align: center;">
+                <img id="editPreviewImg" src="" alt="预览" style="max-width: 100%; max-height: 200px; border-radius: 8px; border: 1px solid #ddd;">
+            </div>
+            <textarea id="editPromptInput" placeholder="描述你想要的编辑效果..." rows="3" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 8px; resize: none; font-size: 14px; font-family: inherit;"></textarea>
+            <div style="display: flex; gap: 10px; margin-top: 16px; justify-content: flex-end;">
+                <button class="image-action-btn" onclick="hideEditImageDialog()">取消</button>
+                <button class="image-action-btn primary" onclick="editImage()">编辑</button>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -280,36 +329,73 @@
 
             try {
                 let result;
-                if (hasImage) {
-                    // 使用 multipart/form-data 发送图片
-                    const formData = new FormData();
-                    formData.append('model', currentModel);
-                    if (currentConversationId) formData.append('conversationId', currentConversationId);
-                    formData.append('message', message || '请描述这张图片');
-                    formData.append('image', selectedImageFile);
+                let handled = false;
 
-                    const res = await fetch('/api/chat/send-with-image', {
-                        method: 'POST',
-                        body: formData
-                    });
-                    if (!res.ok) {
-                        const errData = await res.json().catch(() => ({ error: 'HTTP ' + res.status }));
-                        throw new Error(errData.error || 'HTTP ' + res.status);
+                // qwen-image 模型下的特殊处理
+                if (currentModel === 'qwen-image') {
+                    if (hasImage) {
+                        // 有上传图片 = 图片编辑流程
+                        const message2 = message || '请编辑这张图片';
+                        removeTypingIndicator(loadingId);
+                        const loadingId2 = showTypingIndicator();
+
+                        const formData = new FormData();
+                        formData.append('prompt', message2);
+                        if (currentConversationId) formData.append('conversationId', currentConversationId);
+                        formData.append('image', selectedImageFile);
+
+                        const res = await fetch('/api/chat/edit-image', {
+                            method: 'POST',
+                            body: formData
+                        });
+                        if (!res.ok) {
+                            const errData = await res.json().catch(() => ({ error: 'HTTP ' + res.status }));
+                            throw new Error(errData.error || 'HTTP ' + res.status);
+                        }
+                        result = await res.json();
+                        removeTypingIndicator(loadingId2);
+                        appendMessage('assistant', '图片已编辑', result.editedImageUrl);
+                        handled = true;
+                    } else {
+                        // 无上传图片 = 迭代编辑：自动获取对话中最后一张AI生成的图片
+                        const lastImageUrl = getLastAssistantImageUrl();
+                        if (lastImageUrl) {
+                            removeTypingIndicator(loadingId);
+                            const loadingId2 = showTypingIndicator();
+
+                            // 将最后一张图片转为文件对象，走编辑流程
+                            const imageFile = await fetchImageAsFile(lastImageUrl);
+                            const formData = new FormData();
+                            formData.append('prompt', message);
+                            if (currentConversationId) formData.append('conversationId', currentConversationId);
+                            formData.append('image', imageFile);
+
+                            const res = await fetch('/api/chat/edit-image', {
+                                method: 'POST',
+                                body: formData
+                            });
+                            if (!res.ok) {
+                                const errData = await res.json().catch(() => ({ error: 'HTTP ' + res.status }));
+                                throw new Error(errData.error || 'HTTP ' + res.status);
+                            }
+                            result = await res.json();
+                            removeTypingIndicator(loadingId2);
+                            appendMessage('assistant', '图片已编辑', result.editedImageUrl);
+                            handled = true;
+                        }
+                        // 如果没有找到历史图片，则 fall through 到普通文本聊天
                     }
-                    result = await res.json();
-                } else {
+                }
+
+                if (!handled) {
                     result = await apiCall('/api/chat/send', 'POST', {
                         model: currentModel,
                         conversationId: currentConversationId,
                         message: message
                     });
+                    removeTypingIndicator(loadingId);
+                    appendMessage('assistant', result.reply);
                 }
-
-                // 移除加载动画
-                removeTypingIndicator(loadingId);
-
-                // 显示 AI 回复
-                appendMessage('assistant', result.reply);
 
                 // 如果是新对话，更新会话ID并刷新列表
                 if (!currentConversationId) {
@@ -350,7 +436,14 @@
             const avatar = role === 'user' ? '你' : 'AI';
             const div = document.createElement('div');
             div.className = 'message ' + role;
-            const imgHtml = imageUrl ? `<img src="${imageUrl}" alt="图片" onclick="showFullImage('${imageUrl}')">` : '';
+            let imgHtml = '';
+            if (imageUrl) {
+                imgHtml = `<img src="${imageUrl}" alt="图片" onclick="showFullImage('${imageUrl}')">`;
+                // 为AI生成的图片添加下载按钮
+                if (role === 'assistant') {
+                    imgHtml += `<a href="${imageUrl}" download style="display:inline-block;margin-top:4px;padding:4px 10px;background:#7b1fa2;color:#fff;border-radius:4px;font-size:12px;text-decoration:none;cursor:pointer;">⬇ 下载图片</a>`;
+                }
+            }
             div.innerHTML = `
                 <div class="avatar">${avatar}</div>
                 <div class="bubble">${imgHtml}${escapeHtml(content)}</div>`;
@@ -390,11 +483,43 @@
             currentConversationId = null;
             newConversation();
             loadConversations();
+
+            // 根据模型显示/隐藏图像相关按钮
+            const isImageModel = currentModel === 'qwen-image';
+            document.getElementById('generateImageBtn').style.display = isImageModel ? '' : 'none';
+            document.getElementById('uploadImageBtn').style.display = isImageModel ? '' : 'none';
+
+            // 切换模型时清除图片选择
+            clearImageSelection();
+
+            // 更新输入框提示
+            const input = document.getElementById('messageInput');
+            input.placeholder = isImageModel
+                ? '输入修改意见（自动基于上一张图片编辑），或点击 📎 上传新图片...'
+                : '输入消息... (Enter 发送, Shift+Enter 换行)';
         }
 
         // ==================== 工具函数 ====================
+
+        /** 获取对话中最后一张AI生成的图片URL */
+        function getLastAssistantImageUrl() {
+            const msgs = document.querySelectorAll('#chatMessages .message.assistant img');
+            if (msgs.length > 0) {
+                return msgs[msgs.length - 1].src;
+            }
+            return null;
+        }
+
+        /** 将图片URL转为File对象，用于FormData上传 */
+        async function fetchImageAsFile(imageUrl) {
+            const response = await fetch(imageUrl);
+            const blob = await response.blob();
+            const ext = blob.type.includes('jpeg') ? '.jpg' : '.png';
+            return new File([blob], 'image' + ext, { type: blob.type });
+        }
+
         function getModelLabel(model) {
-            const labels = { openai: 'OpenAI', deepseek: 'DeepSeek', qwen: '通义千问', 'qwen-vision': '千问视觉', teacher: '温柔老师' };
+            const labels = { openai: 'OpenAI', deepseek: 'DeepSeek', qwen: '通义千问', 'qwen-image': '千问图像' };
             return labels[model] || model;
         }
 
@@ -461,6 +586,133 @@
             const overlay = document.getElementById('imageOverlay');
             document.getElementById('overlayImage').src = url;
             overlay.classList.add('active');
+        }
+
+        // ==================== 图像生成/编辑 ====================
+        function showGenerateImageDialog() {
+            document.getElementById('generateImageDialog').classList.add('active');
+            document.getElementById('generatePromptInput').focus();
+        }
+
+        function hideGenerateImageDialog() {
+            document.getElementById('generateImageDialog').classList.remove('active');
+            document.getElementById('generatePromptInput').value = '';
+        }
+
+        async function generateImage() {
+            const prompt = document.getElementById('generatePromptInput').value.trim();
+            if (!prompt) { alert('请输入图片描述'); return; }
+
+            hideGenerateImageDialog();
+
+            // 显示用户消息
+            const emptyState = document.getElementById('emptyState');
+            if (emptyState) emptyState.remove();
+            appendMessage('user', '🎨 生成图片: ' + prompt);
+
+            const loadingId = showTypingIndicator();
+            const sendBtn = document.getElementById('sendBtn');
+            sendBtn.disabled = true;
+
+            try {
+                const result = await apiCall('/api/chat/generate-image', 'POST', {
+                    prompt: prompt,
+                    conversationId: currentConversationId
+                });
+
+                removeTypingIndicator(loadingId);
+
+                // 显示生成的图片
+                appendMessage('assistant', '图片已生成', result.imageUrl);
+
+                // 如果是新对话，更新会话ID
+                if (!currentConversationId) {
+                    await loadConversations();
+                    if (conversations.length > 0) {
+                        currentConversationId = conversations[conversations.length - 1].id;
+                        renderConversationList();
+                    }
+                } else {
+                    await loadConversations();
+                }
+            } catch (error) {
+                removeTypingIndicator(loadingId);
+                appendMessage('assistant', '图片生成失败: ' + error.message);
+            }
+
+            sendBtn.disabled = false;
+            document.getElementById('messageInput').focus();
+        }
+
+        function hideEditImageDialog() {
+            document.getElementById('editImageDialog').classList.remove('active');
+            document.getElementById('editPromptInput').value = '';
+        }
+
+        // 当选择 qwen-image 模型且有选中图片时，弹出编辑对话框
+        function showEditImageDialog(imageUrl) {
+            const overlay = document.getElementById('editImageDialog');
+            document.getElementById('editPreviewImg').src = imageUrl;
+            overlay.classList.add('active');
+            document.getElementById('editPromptInput').focus();
+        }
+
+        async function editImage() {
+            const prompt = document.getElementById('editPromptInput').value.trim();
+            if (!prompt) { alert('请输入编辑描述'); return; }
+            if (!selectedImageFile) { alert('请先选择图片'); return; }
+
+            hideEditImageDialog();
+
+            const emptyState = document.getElementById('emptyState');
+            if (emptyState) emptyState.remove();
+
+            // 显示用户消息（含原始图片预览）
+            const previewUrl = URL.createObjectURL(selectedImageFile);
+            appendMessage('user', '🖌 编辑图片: ' + prompt, previewUrl);
+
+            const loadingId = showTypingIndicator();
+            const sendBtn = document.getElementById('sendBtn');
+            sendBtn.disabled = true;
+
+            try {
+                const formData = new FormData();
+                formData.append('prompt', prompt);
+                if (currentConversationId) formData.append('conversationId', currentConversationId);
+                formData.append('image', selectedImageFile);
+
+                const res = await fetch('/api/chat/edit-image', {
+                    method: 'POST',
+                    body: formData
+                });
+                if (!res.ok) {
+                    const errData = await res.json().catch(() => ({ error: 'HTTP ' + res.status }));
+                    throw new Error(errData.error || 'HTTP ' + res.status);
+                }
+                const result = await res.json();
+
+                removeTypingIndicator(loadingId);
+
+                // 显示编辑后的图片
+                appendMessage('assistant', '图片已编辑', result.editedImageUrl);
+
+                if (!currentConversationId) {
+                    await loadConversations();
+                    if (conversations.length > 0) {
+                        currentConversationId = conversations[conversations.length - 1].id;
+                        renderConversationList();
+                    }
+                } else {
+                    await loadConversations();
+                }
+            } catch (error) {
+                removeTypingIndicator(loadingId);
+                appendMessage('assistant', '图片编辑失败: ' + error.message);
+            }
+
+            clearImageSelection();
+            sendBtn.disabled = false;
+            document.getElementById('messageInput').focus();
         }
     </script>
 </body>

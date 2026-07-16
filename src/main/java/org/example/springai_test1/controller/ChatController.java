@@ -60,9 +60,14 @@ public class ChatController {
             return ResponseEntity.badRequest().body(Map.of("error", "消息内容不能为空"));
         }
 
-        String reply = chatService.chat(model, conversationId, message);
-        logger.info("API调用成功 - 发送消息完成: 模型={}, 回复长度={}", model, reply.length());
-        return ResponseEntity.ok(Map.of("reply", reply, "model", model));
+        try {
+            String reply = chatService.chat(model, conversationId, message);
+            logger.info("API调用成功 - 发送消息完成: 模型={}, 回复长度={}", model, reply.length());
+            return ResponseEntity.ok(Map.of("reply", reply, "model", model));
+        } catch (Exception e) {
+            logger.error("聊天请求失败 - 模型={}, 会话ID={}", model, conversationId, e);
+            return ResponseEntity.internalServerError().body(Map.of("error", "聊天请求失败: " + e.getMessage()));
+        }
     }
 
     /**
@@ -154,59 +159,75 @@ public class ChatController {
     // ==================== 图片处理接口 ====================
 
     /**
-     * 上传图片并发送到视觉模型获取AI回复
-     * POST /api/chat/send-with-image
-     * Content-Type: multipart/form-data
-     * Parameters: model, conversationId, message, image (file)
+     * 生成图片
+     * POST /api/chat/generate-image
+     * Body: { "prompt": "一只可爱的猫", "conversationId": "xxx" }
      */
-    @PostMapping(value = "/send-with-image", consumes = "multipart/form-data")
-    public ResponseEntity<Map<String, String>> sendMessageWithImage(
-            @RequestParam(value = "model", defaultValue = "qwen-vision") String model,
-            @RequestParam(value = "conversationId", required = false) String conversationId,
-            @RequestParam(value = "message", required = false) String message,
-            @RequestParam("image") MultipartFile image) {
+    @PostMapping("/generate-image")
+    public ResponseEntity<Map<String, String>> generateImage(@RequestBody Map<String, String> request) {
+        String prompt = request.get("prompt");
+        String conversationId = request.get("conversationId");
+        String size = request.getOrDefault("size", "1024*1024");
 
-        logger.info("API调用 - 发送图片消息: 模型={}, 会话ID={}, 消息={}, 文件名={}, 大小={}",
-                model, conversationId, message, image.getOriginalFilename(), image.getSize());
+        logger.info("API调用 - 生成图片: 提示词={}, 会话ID={}, 尺寸={}", prompt, conversationId, size);
 
-        if (image.isEmpty()) {
-            return ResponseEntity.badRequest().body(Map.of("error", "图片不能为空"));
+        if (prompt == null || prompt.isBlank()) {
+            logger.warn("API调用失败 - 提示词为空");
+            return ResponseEntity.badRequest().body(Map.of("error", "提示词不能为空"));
         }
 
         try {
-            // 保存图片文件
-            String imageUrl = saveImage(image);
-            logger.info("图片已保存, URL: {}", imageUrl);
-
-            // 调用视觉模型
-            String reply = chatService.chatWithImage(model, conversationId,
-                    message != null ? message : "请描述这张图片", imageUrl);
-
-            return ResponseEntity.ok(Map.of("reply", reply, "model", model, "imageUrl", imageUrl));
-        } catch (IOException e) {
-            logger.error("图片保存失败", e);
-            return ResponseEntity.internalServerError().body(Map.of("error", "图片保存失败: " + e.getMessage()));
+            String imageUrl = chatService.generateImage(prompt, conversationId, size);
+            logger.info("API调用成功 - 生成图片完成: 图片URL={}", imageUrl);
+            return ResponseEntity.ok(Map.of("imageUrl", imageUrl, "prompt", prompt));
         } catch (Exception e) {
-            logger.error("视觉模型调用失败", e);
-            return ResponseEntity.internalServerError().body(Map.of("error", "AI处理失败: " + e.getMessage()));
+            logger.error("图片生成失败", e);
+            return ResponseEntity.internalServerError().body(Map.of("error", "图片生成失败: " + e.getMessage()));
         }
     }
 
     /**
-     * 上传图片（仅上传，不发送消息）
-     * POST /api/chat/upload-image
+     * 编辑图片
+     * POST /api/chat/edit-image
+     * Content-Type: multipart/form-data
+     * Parameters: prompt, conversationId, image (file)
      */
-    @PostMapping(value = "/upload-image", consumes = "multipart/form-data")
-    public ResponseEntity<Map<String, String>> uploadImage(@RequestParam("image") MultipartFile image) {
+    @PostMapping(value = "/edit-image", consumes = "multipart/form-data")
+    public ResponseEntity<Map<String, String>> editImage(
+            @RequestParam(value = "prompt") String prompt,
+            @RequestParam(value = "conversationId", required = false) String conversationId,
+            @RequestParam("image") MultipartFile image) {
+
+        logger.info("API调用 - 编辑图片: 提示词={}, 会话ID={}, 文件名={}, 大小={}",
+                prompt, conversationId, image.getOriginalFilename(), image.getSize());
+
         if (image.isEmpty()) {
             return ResponseEntity.badRequest().body(Map.of("error", "图片不能为空"));
         }
+
+        if (prompt == null || prompt.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "编辑提示词不能为空"));
+        }
+
         try {
-            String imageUrl = saveImage(image);
-            return ResponseEntity.ok(Map.of("imageUrl", imageUrl));
+            // 先保存图片文件（用于前端显示原始图片）
+            String originalImageUrl = saveImage(image);
+            logger.info("原始图片已保存, URL: {}", originalImageUrl);
+
+            // 调用图片编辑服务
+            String editedImageUrl = chatService.editImage(prompt, conversationId, image.getBytes(), originalImageUrl);
+
+            return ResponseEntity.ok(Map.of(
+                    "editedImageUrl", editedImageUrl,
+                    "originalImageUrl", originalImageUrl,
+                    "prompt", prompt
+            ));
         } catch (IOException e) {
-            logger.error("图片上传失败", e);
-            return ResponseEntity.internalServerError().body(Map.of("error", "图片上传失败: " + e.getMessage()));
+            logger.error("图片保存失败", e);
+            return ResponseEntity.internalServerError().body(Map.of("error", "图片保存失败: " + e.getMessage()));
+        } catch (Exception e) {
+            logger.error("图片编辑失败", e);
+            return ResponseEntity.internalServerError().body(Map.of("error", "图片编辑失败: " + e.getMessage()));
         }
     }
 
@@ -226,9 +247,9 @@ public class ChatController {
         }
         String filename = UUID.randomUUID().toString() + extension;
 
-        // 保存文件
+        // 保存文件（使用 Files.copy 避免 transferTo 临时文件路径问题）
         Path filePath = uploadPath.resolve(filename);
-        image.transferTo(filePath.toFile());
+        Files.copy(image.getInputStream(), filePath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         logger.info("图片保存到: {}", filePath);
 
         // 返回可访问的URL（通过静态资源映射）
