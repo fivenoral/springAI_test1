@@ -38,6 +38,10 @@
         .conversation-item:hover .conv-delete { opacity: 1; }
         .conversation-item .conv-delete:hover { color: #e53935; }
 
+        /* 对话分组标题 */
+        .conv-group-header { padding: 6px 12px; font-size: 11px; color: #999; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 8px; }
+        .conv-group-header:first-child { margin-top: 0; }
+
         /* 聊天区域 */
         .chat-area { flex: 1; display: flex; flex-direction: column; }
         .chat-messages { flex: 1; overflow-y: auto; padding: 20px; }
@@ -46,7 +50,7 @@
         .message .avatar { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; flex-shrink: 0; }
         .message.user .avatar { background: #1976d2; color: #fff; }
         .message.assistant .avatar { background: #43a047; color: #fff; }
-        .message .bubble { max-width: 70%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+        .message .bubble { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; font-size: 14px; white-space: pre-wrap; overflow-wrap: break-word; }
         .message.user .bubble { background: #1976d2; color: #fff; border-top-right-radius: 4px; }
         .message.assistant .bubble { background: #fff; color: #333; border-top-left-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
         
@@ -100,6 +104,15 @@
         .image-action-btn:hover { background: #f0f0f0; }
         .image-action-btn.primary { background: #7b1fa2; color: #fff; border-color: #7b1fa2; }
         .image-action-btn.primary:hover { background: #6a1b9a; }
+
+        /* 思考过程折叠区域 */
+        .thinking-block { margin-top: 8px; border: 1px solid #e8e0f0; border-radius: 8px; overflow: hidden; }
+        .thinking-header { display: flex; align-items: center; gap: 6px; padding: 6px 12px; background: #f5f0fa; cursor: pointer; user-select: none; font-size: 12px; color: #7b1fa2; }
+        .thinking-header:hover { background: #ede5f5; }
+        .thinking-header .arrow { transition: transform 0.2s; font-size: 10px; }
+        .thinking-header .arrow.open { transform: rotate(90deg); }
+        .thinking-content { display: none; padding: 10px 14px; font-size: 12px; line-height: 1.6; color: #666; white-space: pre-wrap; overflow-wrap: break-word; background: #faf8fc; border-top: 1px solid #e8e0f0; max-height: 400px; overflow-y: auto; }
+        .thinking-content.open { display: block; }
     </style>
 </head>
 <body>
@@ -145,6 +158,7 @@
             <div class="chat-input">
                 <button id="generateImageBtn" onclick="showGenerateImageDialog()" title="生成图片" style="padding: 10px 12px; background: #fff; color: #7b1fa2; border: 1px solid #7b1fa2; border-radius: 8px; cursor: pointer; font-size: 16px;">🎨</button>
                 <button id="uploadImageBtn" onclick="document.getElementById('imageFileInput').click()" title="上传图片进行编辑" style="display: none; padding: 10px 12px; background: #fff; color: #7b1fa2; border: 1px solid #7b1fa2; border-radius: 8px; cursor: pointer; font-size: 16px;">📎</button>
+                <button id="thinkingToggleBtn" onclick="toggleThinkingMode()" title="深度思考模式（仅 DeepSeek）" style="display: none; padding: 10px 12px; background: #fff; color: #999; border: 1px solid #ddd; border-radius: 8px; cursor: pointer; font-size: 16px;" title="">🧠</button>
                 <textarea id="messageInput" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1" onkeydown="handleKeyDown(event)"></textarea>
                 <button id="sendBtn" onclick="sendMessage()">发送</button>
             </div>
@@ -206,6 +220,7 @@
         let currentConversationId = null;
         let conversations = [];
         let selectedImageFile = null;  // 当前选中的图片文件
+        let thinkingMode = false;      // 深度思考模式开关
 
         // ==================== 初始化 ====================
         document.addEventListener('DOMContentLoaded', () => {
@@ -243,17 +258,43 @@
                 list.innerHTML = '<div style="padding: 20px; text-align: center; color: #999; font-size: 13px;">暂无对话记录</div>';
                 return;
             }
-            list.innerHTML = conversations.map(c => {
-                const firstMsg = getFirstUserMessage(c);
-                return `
-                <div class="conversation-item ${c.id === currentConversationId ? 'active' : ''}" onclick="selectConversation('${c.id}')">
-                    <div class="conv-info">
-                        <div class="conv-model model-${c.model}">${getModelLabel(c.model)}${firstMsg ? '（' + escapeHtml(firstMsg) + '）' : ''}</div>
-                        <div class="conv-time">${formatTime(c.createdAt)}</div>
-                    </div>
-                    <span class="conv-delete" onclick="event.stopPropagation(); deleteConversation('${c.id}')" title="删除">✕</span>
-                </div>`;
-            }).join('');
+            // 按最后一条消息时间分组（而非会话创建时间）
+            const now = new Date();
+            const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+            const weekAgoStart = todayStart - 7 * 24 * 60 * 60 * 1000;
+            const groups = { today: [], week: [], earlier: [] };
+            conversations.forEach(c => {
+                // 优先使用最后一条消息的时间，回退到 createdAt
+                let t;
+                if (c.messages && c.messages.length > 0) {
+                    const lastMsg = c.messages[c.messages.length - 1];
+                    t = lastMsg.timestamp ? new Date(lastMsg.timestamp).getTime() : new Date(c.createdAt).getTime();
+                } else {
+                    t = new Date(c.createdAt).getTime();
+                }
+                if (isNaN(t)) t = new Date(c.createdAt).getTime();
+                if (t >= todayStart) groups.today.push(c);
+                else if (t >= weekAgoStart) groups.week.push(c);
+                else groups.earlier.push(c);
+            });
+            const groupLabels = { today: '今天', week: '七天内', earlier: '更早以前' };
+            let html = '';
+            for (const [key, items] of Object.entries(groups)) {
+                if (items.length === 0) continue;
+                html += `<div class="conv-group-header">${groupLabels[key]}</div>`;
+                html += items.map(c => {
+                    const firstMsg = getFirstUserMessage(c);
+                    return `
+                    <div class="conversation-item ${c.id === currentConversationId ? 'active' : ''}" onclick="selectConversation('${c.id}')">
+                        <div class="conv-info">
+                            <div class="conv-model model-${c.model}">${getModelLabel(c.model)}${firstMsg ? '（' + escapeHtml(firstMsg) + '）' : ''}</div>
+                            <div class="conv-time">${formatTime(c.createdAt)}</div>
+                        </div>
+                        <span class="conv-delete" onclick="event.stopPropagation(); deleteConversation('${c.id}')" title="删除">✕</span>
+                    </div>`;
+                }).join('');
+            }
+            list.innerHTML = html;
         }
 
         function selectConversation(id) {
@@ -391,10 +432,11 @@
                     result = await apiCall('/api/chat/send', 'POST', {
                         model: currentModel,
                         conversationId: currentConversationId,
-                        message: message
+                        message: message,
+                        thinkingMode: thinkingMode ? 'true' : 'false'
                     });
                     removeTypingIndicator(loadingId);
-                    appendMessage('assistant', result.reply);
+                    appendMessage('assistant', result.reply, null, result.reasoningContent);
                 }
 
                 // 如果是新对话，更新会话ID并刷新列表
@@ -428,10 +470,10 @@
                     </div>`;
                 return;
             }
-            messages.forEach(msg => appendMessage(msg.role, msg.content, msg.imageUrl));
+            messages.forEach(msg => appendMessage(msg.role, msg.content, msg.imageUrl, msg.reasoningContent));
         }
 
-        function appendMessage(role, content, imageUrl) {
+        function appendMessage(role, content, imageUrl, reasoningContent) {
             const container = document.getElementById('chatMessages');
             const avatar = role === 'user' ? '你' : 'AI';
             const div = document.createElement('div');
@@ -444,9 +486,25 @@
                     imgHtml += `<a href="${imageUrl}" download style="display:inline-block;margin-top:4px;padding:4px 10px;background:#7b1fa2;color:#fff;border-radius:4px;font-size:12px;text-decoration:none;cursor:pointer;">⬇ 下载图片</a>`;
                 }
             }
+            // 构建思考过程折叠区域
+            let thinkingHtml = '';
+            if (reasoningContent && reasoningContent.trim()) {
+                const thinkingId = 'thinking-' + Date.now() + '-' + Math.random().toString(36).substr(2, 5);
+                thinkingHtml = `
+                <div class="thinking-block">
+                    <div class="thinking-header" onclick="toggleThinking('${thinkingId}')">
+                        <span class="arrow" id="${thinkingId}-arrow">▶</span>
+                        <span>💭 思考过程</span>
+                    </div>
+                    <div class="thinking-content" id="${thinkingId}">${escapeHtml(reasoningContent)}</div>
+                </div>`;
+            }
             div.innerHTML = `
                 <div class="avatar">${avatar}</div>
-                <div class="bubble">${imgHtml}${escapeHtml(content)}</div>`;
+                <div>
+                    <div class="bubble">${imgHtml}${escapeHtml(content)}</div>
+                    ${thinkingHtml}
+                </div>`;
             container.appendChild(div);
             container.scrollTop = container.scrollHeight;
         }
@@ -489,6 +547,12 @@
             document.getElementById('generateImageBtn').style.display = isImageModel ? '' : 'none';
             document.getElementById('uploadImageBtn').style.display = isImageModel ? '' : 'none';
 
+            // 深度思考模式按钮仅在选择 DeepSeek 时显示
+            const isDeepSeek = currentModel === 'deepseek';
+            document.getElementById('thinkingToggleBtn').style.display = isDeepSeek ? '' : 'none';
+            if (!isDeepSeek) thinkingMode = false;
+            updateThinkingButtonStyle();
+
             // 切换模型时清除图片选择
             clearImageSelection();
 
@@ -497,6 +561,26 @@
             input.placeholder = isImageModel
                 ? '输入修改意见（自动基于上一张图片编辑），或点击 📎 上传新图片...'
                 : '输入消息... (Enter 发送, Shift+Enter 换行)';
+        }
+
+        function toggleThinkingMode() {
+            thinkingMode = !thinkingMode;
+            updateThinkingButtonStyle();
+        }
+
+        function updateThinkingButtonStyle() {
+            const btn = document.getElementById('thinkingToggleBtn');
+            if (thinkingMode) {
+                btn.style.background = '#7b1fa2';
+                btn.style.color = '#fff';
+                btn.style.borderColor = '#7b1fa2';
+                btn.title = '深度思考模式：已开启（点击关闭）';
+            } else {
+                btn.style.background = '#fff';
+                btn.style.color = '#999';
+                btn.style.borderColor = '#ddd';
+                btn.title = '深度思考模式：已关闭（点击开启）';
+            }
         }
 
         // ==================== 工具函数 ====================
@@ -586,6 +670,15 @@
             const overlay = document.getElementById('imageOverlay');
             document.getElementById('overlayImage').src = url;
             overlay.classList.add('active');
+        }
+
+        function toggleThinking(id) {
+            const content = document.getElementById(id);
+            const arrow = document.getElementById(id + '-arrow');
+            if (content && arrow) {
+                content.classList.toggle('open');
+                arrow.classList.toggle('open');
+            }
         }
 
         // ==================== 图像生成/编辑 ====================

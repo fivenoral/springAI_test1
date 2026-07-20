@@ -13,17 +13,19 @@ public class ChatMessageDTO {
     private String content;
     private String model;
     private String imageUrl;
+    private String reasoningContent;
     private LocalDateTime timestamp;
 
     public ChatMessageDTO() {
     }
 
-    public ChatMessageDTO(Long id, String role, String content, String model, String imageUrl, LocalDateTime timestamp) {
+    public ChatMessageDTO(Long id, String role, String content, String model, String imageUrl, String reasoningContent, LocalDateTime timestamp) {
         this.id = id;
         this.role = role;
         this.content = content;
         this.model = model;
         this.imageUrl = imageUrl;
+        this.reasoningContent = reasoningContent;
         this.timestamp = timestamp;
     }
 
@@ -75,5 +77,13 @@ public class ChatMessageDTO {
 
     public void setTimestamp(LocalDateTime timestamp) {
         this.timestamp = timestamp;
+    }
+
+    public String getReasoningContent() {
+        return reasoningContent;
+    }
+
+    public void setReasoningContent(String reasoningContent) {
+        this.reasoningContent = reasoningContent;
     }
 }

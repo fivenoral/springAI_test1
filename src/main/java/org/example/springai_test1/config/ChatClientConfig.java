@@ -5,6 +5,7 @@ import com.openai.client.OpenAIClientAsync;
 import org.example.springai_test1.advisor.ReReadingAdvisor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor;
+import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.openai.setup.OpenAiSetup;
@@ -54,14 +55,17 @@ public class ChatClientConfig {
      * OpenAI ChatClient
      * 使用自动注入的 OpenAiChatModel（由 spring-ai-starter-model-openai 自动配置）
      */
+    @SuppressWarnings({"deprecation", "removal"}) // defaultToolCallbacks 在 2.0.0-M7 已废弃，但无替代 API
     @Bean(name = "openAiChatClient")
     public ChatClient openAiChatClient(OpenAiChatModel openAiChatModel, 
                                        SimpleLoggerAdvisor simpleLoggerAdvisor,
                                        ReReadingAdvisor reReadingAdvisor,
-                                       Object[] allToolCallbacks) {
+                                       Object[] allToolCallbacks,
+                                       SyncMcpToolCallbackProvider mcpToolProvider) {
         return ChatClient.builder(openAiChatModel)
                 .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor)
                 .defaultTools(allToolCallbacks)
+                .defaultToolCallbacks(mcpToolProvider.getToolCallbacks())
                 .build();
     }
 
@@ -70,10 +74,12 @@ public class ChatClientConfig {
      * DeepSeek 兼容 OpenAI 协议，通过 OpenAiSetup 创建指向 DeepSeek API 的客户端，
      * 手动构建独立的 OpenAiChatModel 实例，避免与 OpenAI 的自动配置冲突。
      */
+    @SuppressWarnings({"deprecation", "removal"}) // defaultToolCallbacks 在 2.0.0-M7 已废弃，但无替代 API
     @Bean(name = "deepSeekChatClient")
     public ChatClient deepSeekChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor,
                                          ReReadingAdvisor reReadingAdvisor,
-                                         Object[] allToolCallbacks) {
+                                         Object[] allToolCallbacks,
+                                         SyncMcpToolCallbackProvider mcpToolProvider) {
         OpenAIClient deepSeekClient = OpenAiSetup.setupSyncClient(
                 deepSeekBaseUrl, deepSeekApiKey, null, null, null, null,
                 false, false, deepSeekModel, Duration.ofSeconds(60), 0, null, null);
@@ -87,24 +93,26 @@ public class ChatClientConfig {
                 .options(OpenAiChatOptions.builder()
                         .model(deepSeekModel)
                         .build())
-                .build()
-                ;
+                .build();
 
         return ChatClient.builder(chatModel)
                 /*.defaultSystem("You are a helpful assistant.")*/   //系统元数据
                 .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor)
                 .defaultTools(allToolCallbacks)
+                .defaultToolCallbacks(mcpToolProvider.getToolCallbacks())
                 .build();
     }
-
+    
     /**
      * 通义千问（Qwen）ChatClient
      * 通过 DashScope 的 OpenAI 兼容接口接入，使用 OpenAiSetup 创建客户端。
      */
+    @SuppressWarnings({"deprecation", "removal"}) // defaultToolCallbacks 在 2.0.0-M7 已废弃，但无替代 API
     @Bean(name = "qwenChatClient")
     public ChatClient qwenChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor,
                                      ReReadingAdvisor reReadingAdvisor,
-                                     Object[] allToolCallbacks) {
+                                     Object[] allToolCallbacks,
+                                     SyncMcpToolCallbackProvider mcpToolProvider) {
         OpenAIClient qwenClient = OpenAiSetup.setupSyncClient(
                 qwenBaseUrl, qwenApiKey, null, null, null, null,
                 false, false, qwenModel, Duration.ofSeconds(60), 0, null, null);
@@ -123,6 +131,7 @@ public class ChatClientConfig {
         return ChatClient.builder(chatModel)
                 .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor)
                 .defaultTools(allToolCallbacks)
+                .defaultToolCallbacks(mcpToolProvider.getToolCallbacks())
                 .build();
     }
 

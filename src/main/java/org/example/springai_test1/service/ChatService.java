@@ -1,5 +1,6 @@
 package org.example.springai_test1.service;
 
+import org.example.springai_test1.dto.ChatResult;
 import org.example.springai_test1.model.Conversation;
 
 import java.util.List;
@@ -17,9 +18,20 @@ public interface ChatService {
      * @param model          模型标识：openai / deepseek / qwen
      * @param conversationId 会话ID（为空则自动创建新会话）
      * @param userMessage    用户消息内容
-     * @return AI 回复内容
+     * @return 聊天结果（包含回复内容和可选的思考过程）
      */
-    String chat(String model, String conversationId, String userMessage);
+    ChatResult chat(String model, String conversationId, String userMessage);
+
+    /**
+     * 发送消息并获取 AI 回复（带上下文和思考模式控制）
+     *
+     * @param model          模型标识：openai / deepseek / qwen
+     * @param conversationId 会话ID（为空则自动创建新会话）
+     * @param userMessage    用户消息内容
+     * @param thinkingMode   是否启用深度思考模式（仅 DeepSeek 支持）
+     * @return 聊天结果（包含回复内容和可选的思考过程）
+     */
+    ChatResult chat(String model, String conversationId, String userMessage, boolean thinkingMode);
 
     /**
      * 生成图片并保存到本地

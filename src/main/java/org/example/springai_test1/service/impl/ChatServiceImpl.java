@@ -2,7 +2,9 @@ package org.example.springai_test1.service.impl;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.Resource;
+import org.example.springai_test1.dto.ChatResult;
 import org.example.springai_test1.model.ChatMessage;
 import org.example.springai_test1.model.ChatMessageHis;
 import org.example.springai_test1.model.Conversation;
@@ -14,20 +16,27 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
+import org.springframework.ai.tool.ToolCallback;
+import org.springframework.ai.tool.annotation.Tool;
+import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.ClassUtils;
 
+import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -54,6 +63,15 @@ public class ChatServiceImpl implements ChatService {
     @Value("${spring.ai.qwen.image.model:qwen-image-edit-max}")
     private String qwenImageModel;
 
+    @Value("${spring.ai.deepseek.api-key:}")
+    private String deepSeekApiKey;
+
+    @Value("${spring.ai.deepseek.base-url:https://aigw.telecomjs.com/v1}")
+    private String deepSeekBaseUrl;
+
+    @Value("${spring.ai.deepseek.chat.options.model:deepseek-v4-pro}")
+    private String deepSeekModel;
+
     private final HttpClient imageHttpClient = HttpClient.newHttpClient();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -70,8 +88,53 @@ public class ChatServiceImpl implements ChatService {
     @Autowired
     private ConversationRepository conversationRepository;
 
+    @Autowired(required = false)
+    private Object[] allToolCallbacks;
+
+    @Autowired(required = false)
+    private SyncMcpToolCallbackProvider mcpToolProvider;
+
+    @PostConstruct
+    public void init() {
+        if (allToolCallbacks == null) {
+            logger.warn("[启动诊断] allToolCallbacks = null，本地工具注入失败！");
+        } else {
+            logger.info("[启动诊断] allToolCallbacks 共 {} 个 bean:", allToolCallbacks.length);
+            for (Object bean : allToolCallbacks) {
+                Class<?> userClass = ClassUtils.getUserClass(bean.getClass());
+                logger.info("  - bean: {} (代理类: {})", userClass.getSimpleName(), bean.getClass().getName());
+                for (Method m : userClass.getDeclaredMethods()) {
+                    if (m.isAnnotationPresent(Tool.class)) {
+                        logger.info("    @Tool 方法: {} - {}", m.getName(), m.getAnnotation(Tool.class).description().substring(0, Math.min(60, m.getAnnotation(Tool.class).description().length())));
+                    }
+                }
+            }
+        }
+        // 诊断 MCP 工具
+        if (mcpToolProvider == null) {
+            logger.warn("[启动诊断] mcpToolProvider = null，MCP 工具不可用！");
+        } else {
+            try {
+                ToolCallback[] mcpCallbacks = mcpToolProvider.getToolCallbacks();
+                logger.info("[启动诊断] MCP 工具共 {} 个:", mcpCallbacks != null ? mcpCallbacks.length : 0);
+                if (mcpCallbacks != null) {
+                    for (ToolCallback cb : mcpCallbacks) {
+                        logger.info("  - MCP 工具: {} - {}", cb.getToolDefinition().name(), cb.getToolDefinition().description());
+                    }
+                }
+            } catch (Exception e) {
+                logger.warn("[启动诊断] 获取 MCP 工具失败: {}", e.getMessage());
+            }
+        }
+    }
+
     @Override
-    public String chat(String model, String conversationId, String userMessage) {
+    public ChatResult chat(String model, String conversationId, String userMessage) {
+        return chat(model, conversationId, userMessage, false);
+    }
+
+    @Override
+    public ChatResult chat(String model, String conversationId, String userMessage, boolean thinkingMode) {
         logger.info("收到聊天请求 - 模型: {}, 会话ID: {}, 用户消息: {}", model, conversationId, userMessage);
 
         // 1. 获取或创建会话
@@ -101,22 +164,54 @@ public class ChatServiceImpl implements ChatService {
         userMsgHis.setTimestamp(userMsg.getTimestamp());
         conversationRepository.saveMessageHis(userMsgHis);
 
-        // 3. 构建上下文消息列表（用于传递给 AI 模型）
-        List<Message> contextMessages = buildContextMessages(convId);
+        // 3. 调用对应的 AI 模型
+        String aiReply;
+        String reasoningContent = null;
 
-        // 4. 调用对应的 AI 模型（ReReadingAdvisor 会自动处理消息增强）
-        ChatClient chatClient = getChatClient(model);
-        String aiReply = chatClient.prompt()
-                /*.system(s -> s.text("You are a helpful assistant."))*/     //系统元数据
-                /*.user(u -> u.text("What's the weather like?")
-                        .metadata("messageId", "msg-123"))*/     //用户元数据
-                .messages(contextMessages)
-                .user(u->u.text(userMessage)/*.media()  // 通过该方法使输入包含图片音频等*/)
-                .call()
-                .content();
+        if ("deepseek".equalsIgnoreCase(model)) {
+            // DeepSeek 模型：始终走 HTTP 直连路径（Spring AI 适配器无法处理 reasoning_content）
+            // 当 thinkingMode 开启或历史消息含 reasoning_content 时，必须启用思考模式并回传 reasoning_content
+            boolean effectiveThinking = thinkingMode || hasReasoningContentInHistory(convId);
+            List<Map<String, Object>> rawMessages = buildRawContextMessages(convId, effectiveThinking);
+            try {
+                String[] rawResult = callDeepSeekRaw(rawMessages, effectiveThinking);
+                aiReply = rawResult[0];
+                reasoningContent = rawResult[1];
+            } catch (Exception e) {
+                logger.error("DeepSeek 调用失败", e);
+                throw new RuntimeException("DeepSeek 调用失败: " + e.getMessage(), e);
+            }
+            // 用户关闭思考模式时，丢弃 API 返回的 reasoning_content（电信网关模型默认会返回）
+            if (!thinkingMode) {
+                reasoningContent = null;
+            }
+        } else {
+            // 普通模式：使用 Spring AI ChatClient
+            List<Message> contextMessages = buildContextMessages(convId);
+            ChatClient chatClient = getChatClient(model);
+            ChatResponse chatResponse = chatClient.prompt()
+                    .messages(contextMessages)
+                    .user(u -> u.text(userMessage))
+                    .call()
+                    .chatResponse();
+
+            aiReply = chatResponse.getResult().getOutput().getText();
+
+            // 提取 reasoning_content（如果有）
+            Map<String, Object> msgMeta = chatResponse.getResult().getOutput().getMetadata();
+            if (msgMeta != null) {
+                Object rc = msgMeta.get("reasoningContent");
+                if (rc == null) rc = msgMeta.get("reasoning_content");
+                if (rc != null) reasoningContent = rc.toString();
+            }
+        }
+        logger.info("AI响应 - 模型: {}, 包含reasoning_content: {}", model, reasoningContent != null);
 
         // 5. 记录 AI 回复
         ChatMessage assistantMsg = new ChatMessage("assistant", aiReply, model, convId);
+        if (reasoningContent != null) {
+            assistantMsg.setReasoningContent(reasoningContent);
+        }
         conversationRepository.saveMessage(assistantMsg);
         // 同时保存到历史表
         ChatMessageHis assistantMsgHis = new ChatMessageHis("assistant", aiReply, model, convId);
@@ -124,7 +219,7 @@ public class ChatServiceImpl implements ChatService {
         conversationRepository.saveMessageHis(assistantMsgHis);
 
         logger.info("AI回复完成 - 会话ID: {}, 模型: {}, 回复长度: {}", convId, model, aiReply.length());
-        return aiReply;
+        return new ChatResult(aiReply, reasoningContent);
     }
 
     @Override
@@ -575,6 +670,301 @@ public class ChatServiceImpl implements ChatService {
         };
     }
 
+    // ==================== DeepSeek 原生 HTTP 调用（支持 reasoning_content 回传 + 工具调用） ====================
+
+    /**
+     * 检查会话历史中是否存在带 reasoning_content 的 assistant 消息
+     * 如果存在，后续请求必须走 HTTP 直连路径以确保 reasoning_content 被回传
+     */
+    private boolean hasReasoningContentInHistory(String conversationId) {
+        List<ChatMessage> messages = conversationRepository.findMessagesByConversationId(conversationId);
+        for (ChatMessage msg : messages) {
+            if ("assistant".equals(msg.getRole())
+                    && msg.getReasoningContent() != null
+                    && !msg.getReasoningContent().isBlank()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 构建原始消息列表（用于 DeepSeek 直连调用）
+     * @param conversationId 会话ID
+     * @param includeReasoning 是否在 assistant 消息中包含 reasoning_content
+     */
+    private List<Map<String, Object>> buildRawContextMessages(String conversationId, boolean includeReasoning) {
+        List<Map<String, Object>> messages = new ArrayList<>();
+        List<ChatMessage> chatMessages = conversationRepository.findMessagesByConversationId(conversationId);
+        for (ChatMessage msg : chatMessages) {
+            Map<String, Object> message = new HashMap<>();
+            message.put("role", msg.getRole());
+            message.put("content", msg.getContent());
+            if ("assistant".equals(msg.getRole()) && includeReasoning) {
+                // 思考模式下：所有 assistant 消息都必须带 reasoning_content 字段
+                // 有实际内容则用实际内容，没有则补空字符串（API 强制要求）
+                String rc = (msg.getReasoningContent() != null && !msg.getReasoningContent().isBlank())
+                        ? msg.getReasoningContent() : "";
+                message.put("reasoning_content", rc);
+            }
+            messages.add(message);
+        }
+        return messages;
+    }
+
+    /**
+     * 从 @Tool 注解的 Bean 中提取工具定义，转换为 OpenAI function schema 格式
+     * 使用 ClassUtils.getUserClass() 解决 Spring CGLIB 代理类导致注解不可见的问题
+     */
+    private List<Map<String, Object>> buildToolDefinitions() {
+        List<Map<String, Object>> tools = new ArrayList<>();
+
+        // 1. 扫描本地 @Tool 注解的 Bean
+        if (allToolCallbacks != null) {
+            for (Object bean : allToolCallbacks) {
+                Class<?> userClass = ClassUtils.getUserClass(bean.getClass());
+                logger.debug("检查工具类: {} (原始: {})", userClass.getSimpleName(), bean.getClass().getSimpleName());
+
+                for (Method method : userClass.getDeclaredMethods()) {
+                    Tool toolAnnotation = method.getAnnotation(Tool.class);
+                    if (toolAnnotation == null) continue;
+
+                    Map<String, Object> function = new HashMap<>();
+                    function.put("name", method.getName());
+                    function.put("description", toolAnnotation.description());
+
+                    Map<String, Object> properties = new HashMap<>();
+                    List<String> required = new ArrayList<>();
+                    for (Parameter param : method.getParameters()) {
+                        ToolParam toolParam = param.getAnnotation(ToolParam.class);
+                        String paramName = param.getName();
+                        Map<String, Object> prop = new HashMap<>();
+                        prop.put("type", "string");
+                        if (toolParam != null) {
+                            prop.put("description", toolParam.description());
+                        }
+                        properties.put(paramName, prop);
+                        required.add(paramName);
+                    }
+
+                    Map<String, Object> parameters = new HashMap<>();
+                    parameters.put("type", "object");
+                    parameters.put("properties", properties);
+                    parameters.put("required", required);
+                    function.put("parameters", parameters);
+
+                    Map<String, Object> toolDef = new HashMap<>();
+                    toolDef.put("type", "function");
+                    toolDef.put("function", function);
+                    tools.add(toolDef);
+
+                    logger.info("注册本地工具: {} - 参数: {}", method.getName(), properties.keySet());
+                }
+            }
+        }
+
+        // 2. 扫描 MCP 工具（来自 SyncMcpToolCallbackProvider）
+        if (mcpToolProvider != null) {
+            try {
+                ToolCallback[] mcpCallbacks = mcpToolProvider.getToolCallbacks();
+                if (mcpCallbacks != null) {
+                    for (ToolCallback callback : mcpCallbacks) {
+                        var toolDef = callback.getToolDefinition();
+                        Map<String, Object> function = new HashMap<>();
+                        function.put("name", toolDef.name());
+                        function.put("description", toolDef.description());
+                        // inputSchema 已经是 JSON schema 字符串，解析为 Map
+                        try {
+                            Map<String, Object> schema = objectMapper.readValue(toolDef.inputSchema(), Map.class);
+                            function.put("parameters", schema);
+                        } catch (Exception e) {
+                            // 如果解析失败，使用空 schema
+                            function.put("parameters", Map.of("type", "object", "properties", Map.of()));
+                        }
+
+                        Map<String, Object> toolEntry = new HashMap<>();
+                        toolEntry.put("type", "function");
+                        toolEntry.put("function", function);
+                        tools.add(toolEntry);
+
+                        logger.info("注册 MCP 工具: {} - {}", toolDef.name(), toolDef.description());
+                    }
+                }
+            } catch (Exception e) {
+                logger.warn("获取 MCP 工具失败: {}", e.getMessage());
+            }
+        }
+
+        logger.info("共提取 {} 个工具定义（本地 + MCP）", tools.size());
+        return tools;
+    }
+
+    /**
+     * 通过反射执行 @Tool 注解的方法
+     * 使用 ClassUtils.getUserClass() 解决 CGLIB 代理问题
+     */
+    private String executeToolCall(String functionName, String argumentsJson) {
+        // 1. 先尝试本地 @Tool Bean
+        if (allToolCallbacks != null) {
+            for (Object bean : allToolCallbacks) {
+                Class<?> userClass = ClassUtils.getUserClass(bean.getClass());
+                for (Method method : userClass.getDeclaredMethods()) {
+                    Tool toolAnnotation = method.getAnnotation(Tool.class);
+                    if (toolAnnotation == null || !method.getName().equals(functionName)) continue;
+
+                    try {
+                        method.setAccessible(true);
+                        Parameter[] params = method.getParameters();
+                        Object[] methodArgs = new Object[params.length];
+                        Map<String, Object> args = argumentsJson != null && !argumentsJson.isBlank()
+                                ? objectMapper.readValue(argumentsJson, Map.class) : Map.of();
+                        for (int i = 0; i < params.length; i++) {
+                            Object value = args.get(params[i].getName());
+                            if (value != null) {
+                                methodArgs[i] = objectMapper.convertValue(value, params[i].getType());
+                            }
+                        }
+                        Object result = method.invoke(bean, methodArgs);
+                        String resultStr = result != null ? result.toString() : "OK";
+                        logger.info("本地工具调用成功: {} -> {}", functionName, resultStr.length() > 100 ? resultStr.substring(0, 100) + "..." : resultStr);
+                        return resultStr;
+                    } catch (Exception e) {
+                        logger.error("本地工具调用失败: {}", functionName, e);
+                        return "工具调用失败: " + e.getMessage();
+                    }
+                }
+            }
+        }
+
+        // 2. 再尝试 MCP 工具
+        if (mcpToolProvider != null) {
+            try {
+                ToolCallback[] mcpCallbacks = mcpToolProvider.getToolCallbacks();
+                if (mcpCallbacks != null) {
+                    for (ToolCallback callback : mcpCallbacks) {
+                        if (callback.getToolDefinition().name().equals(functionName)) {
+                            String result = callback.call(argumentsJson != null ? argumentsJson : "{}");
+                            logger.info("MCP 工具调用成功: {} -> {}", functionName, result.length() > 100 ? result.substring(0, 100) + "..." : result);
+                            return result;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                logger.error("MCP 工具调用失败: {}", functionName, e);
+                return "MCP 工具调用失败: " + e.getMessage();
+            }
+        }
+
+        return "错误：找不到工具 " + functionName;
+    }
+
+    /**
+     * 直接调用 DeepSeek API（绕过 Spring AI），支持工具调用循环
+     * @param messages 消息列表
+     * @param thinkingMode 是否启用思考模式
+     * @return [content, reasoning_content]
+     */
+    private String[] callDeepSeekRaw(List<Map<String, Object>> messages, boolean thinkingMode) throws Exception {
+        List<Map<String, Object>> toolDefinitions = buildToolDefinitions();
+        int maxTurns = 10; // 防止无限循环
+
+        String finalContent = "";
+        String finalReasoningContent = null;
+
+        for (int turn = 0; turn < maxTurns; turn++) {
+            Map<String, Object> requestBody = new HashMap<>();
+            requestBody.put("model", deepSeekModel);
+            requestBody.put("messages", messages);
+            if (thinkingMode) {
+                requestBody.put("thinking", Map.of("type", "enabled"));
+            }
+            if (!toolDefinitions.isEmpty()) {
+                requestBody.put("tools", toolDefinitions);
+            }
+
+            String jsonBody = objectMapper.writeValueAsString(requestBody);
+            logger.info("DeepSeek 原生请求 (turn {}) - 思考模式: {}, tools数量: {}", turn + 1, thinkingMode, toolDefinitions.size());
+
+            HttpRequest httpRequest = HttpRequest.newBuilder()
+                    .uri(URI.create(deepSeekBaseUrl + "/chat/completions"))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + deepSeekApiKey)
+                    .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                    .timeout(java.time.Duration.ofSeconds(120))
+                    .build();
+
+            HttpResponse<String> response = imageHttpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() != 200) {
+                logger.error("DeepSeek API 错误: {} - {}", response.statusCode(), response.body());
+                throw new RuntimeException("DeepSeek API 返回 " + response.statusCode() + ": " + response.body());
+            }
+
+            JsonNode responseJson = objectMapper.readTree(response.body());
+            JsonNode choice = responseJson.get("choices").get(0);
+            JsonNode messageNode = choice.get("message");
+
+            String content = messageNode.has("content") && !messageNode.get("content").isNull()
+                    ? messageNode.get("content").asText() : "";
+            String reasoningContent = messageNode.has("reasoning_content") && !messageNode.get("reasoning_content").isNull()
+                    ? messageNode.get("reasoning_content").asText() : null;
+
+            // 检查是否有工具调用
+            JsonNode toolCalls = messageNode.get("tool_calls");
+            if (toolCalls == null || !toolCalls.isArray() || toolCalls.isEmpty()) {
+                // 没有工具调用，这是最终回答
+                finalContent = content;
+                finalReasoningContent = reasoningContent;
+                logger.info("DeepSeek 最终响应 (turn {}) - content长度: {}, reasoning长度: {}",
+                        turn + 1, content.length(), reasoningContent != null ? reasoningContent.length() : 0);
+                break;
+            }
+
+            // 有工具调用：将 assistant 消息（含 tool_calls）加入 messages
+            Map<String, Object> assistantMsg = new HashMap<>();
+            assistantMsg.put("role", "assistant");
+            assistantMsg.put("content", content.isEmpty() ? null : content);
+            if (thinkingMode) {
+                // 思考模式下所有 assistant 消息都必须带 reasoning_content
+                assistantMsg.put("reasoning_content", reasoningContent != null ? reasoningContent : "");
+            }
+            // 构建 tool_calls 数组
+            List<Map<String, Object>> toolCallsList = new ArrayList<>();
+            for (JsonNode tc : toolCalls) {
+                Map<String, Object> toolCall = new HashMap<>();
+                toolCall.put("id", tc.get("id").asText());
+                toolCall.put("type", tc.get("type").asText());
+                Map<String, Object> function = new HashMap<>();
+                function.put("name", tc.get("function").get("name").asText());
+                function.put("arguments", tc.get("function").get("arguments").asText());
+                toolCall.put("function", function);
+                toolCallsList.add(toolCall);
+            }
+            assistantMsg.put("tool_calls", toolCallsList);
+            messages.add(assistantMsg);
+
+            // 执行每个工具调用并将结果加入 messages
+            for (JsonNode tc : toolCalls) {
+                String toolCallId = tc.get("id").asText();
+                String funcName = tc.get("function").get("name").asText();
+                String funcArgs = tc.get("function").get("arguments").asText();
+
+                logger.info("执行工具调用: {}({})", funcName, funcArgs.length() > 100 ? funcArgs.substring(0, 100) + "..." : funcArgs);
+                String toolResult = executeToolCall(funcName, funcArgs);
+
+                Map<String, Object> toolMsg = new HashMap<>();
+                toolMsg.put("role", "tool");
+                toolMsg.put("tool_call_id", toolCallId);
+                toolMsg.put("content", toolResult);
+                messages.add(toolMsg);
+            }
+
+            logger.info("工具调用轮次 {} 完成，继续下一轮", turn + 1);
+        }
+
+        return new String[]{finalContent, finalReasoningContent};
+    }
+
     /**
      * 从会话历史构建 Spring AI 的 Message 列表（上下文）
      * 将 ChatMessage 转换为 Spring AI 的 Message 接口实现
@@ -585,7 +975,14 @@ public class ChatServiceImpl implements ChatService {
         for (ChatMessage msg : chatMessages) {
             switch (msg.getRole()) {
                 case "user" -> messages.add(new UserMessage(msg.getContent()));
-                case "assistant" -> messages.add(new AssistantMessage(msg.getContent()));
+                case "assistant" -> {
+                    AssistantMessage assistantMessage = new AssistantMessage(msg.getContent());
+                    // 如果有 reasoning_content（DeepSeek 思考模式），必须通过 metadata 回传给 API
+                    if (msg.getReasoningContent() != null && !msg.getReasoningContent().isBlank()) {
+                        assistantMessage.getMetadata().put("reasoningContent", msg.getReasoningContent());
+                    }
+                    messages.add(assistantMessage);
+                }
                 // system 消息可根据需要扩展
             }
         }

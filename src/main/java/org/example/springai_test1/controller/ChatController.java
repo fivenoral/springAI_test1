@@ -1,5 +1,7 @@
 package org.example.springai_test1.controller;
 
+import org.example.springai_test1.dto.ChatMessageDTO;
+import org.example.springai_test1.dto.ChatResult;
 import org.example.springai_test1.dto.ConversationDTO;
 import org.example.springai_test1.model.Conversation;
 import org.example.springai_test1.repository.ConversationRepository;
@@ -48,25 +50,33 @@ public class ChatController {
      * Body: { "model": "openai", "conversationId": "xxx", "message": "你好" }
      */
     @PostMapping("/send")
-    public ResponseEntity<Map<String, String>> sendMessage(@RequestBody Map<String, String> request) {
+    public ResponseEntity<Map<String, Object>> sendMessage(@RequestBody Map<String, String> request) {
         String model = request.getOrDefault("model", "openai");
         String conversationId = request.get("conversationId");
         String message = request.get("message");
+        boolean thinkingMode = "true".equalsIgnoreCase(request.get("thinkingMode"));
 
-        logger.info("API调用 - 发送消息: 模型={}, 会话ID={}, 消息长度={}", model, conversationId, message != null ? message.length() : 0);
+        logger.info("API调用 - 发送消息: 模型={}, 会话ID={}, 消息长度={}, 思考模式={}", model, conversationId, message != null ? message.length() : 0, thinkingMode);
 
         if (message == null || message.isBlank()) {
             logger.warn("API调用失败 - 消息内容为空");
-            return ResponseEntity.badRequest().body(Map.of("error", "消息内容不能为空"));
+            return ResponseEntity.badRequest().body(Map.<String, Object>of("error", "消息内容不能为空"));
         }
 
         try {
-            String reply = chatService.chat(model, conversationId, message);
-            logger.info("API调用成功 - 发送消息完成: 模型={}, 回复长度={}", model, reply.length());
-            return ResponseEntity.ok(Map.of("reply", reply, "model", model));
+            ChatResult chatResult = chatService.chat(model, conversationId, message, thinkingMode);
+            logger.info("API调用成功 - 发送消息完成: 模型={}, 回复长度={}, 有思考过程={}", model, chatResult.reply().length(), chatResult.reasoningContent() != null);
+
+            Map<String, Object> response = new java.util.HashMap<>();
+            response.put("reply", chatResult.reply());
+            response.put("model", model);
+            if (chatResult.reasoningContent() != null) {
+                response.put("reasoningContent", chatResult.reasoningContent());
+            }
+            return ResponseEntity.ok(response);
         } catch (Exception e) {
             logger.error("聊天请求失败 - 模型={}, 会话ID={}", model, conversationId, e);
-            return ResponseEntity.internalServerError().body(Map.of("error", "聊天请求失败: " + e.getMessage()));
+            return ResponseEntity.internalServerError().body(Map.<String, Object>of("error", "聊天请求失败: " + e.getMessage()));
         }
     }
 
@@ -276,13 +286,14 @@ public class ChatController {
         return dto;
     }
 
-    private org.example.springai_test1.dto.ChatMessageDTO toMessageDTO(org.example.springai_test1.model.ChatMessage message) {
-        return new org.example.springai_test1.dto.ChatMessageDTO(
+    private ChatMessageDTO toMessageDTO(org.example.springai_test1.model.ChatMessage message) {
+        return new ChatMessageDTO(
                 message.getId(),
                 message.getRole(),
                 message.getContent(),
                 message.getModel(),
                 message.getImageUrl(),
+                message.getReasoningContent(),
                 message.getTimestamp()
         );
     }

@@ -35,6 +35,10 @@ public class ChatMessage {
     @Column(name = "image_url")
     private String imageUrl;
 
+    /** 推理内容（可选，用于 DeepSeek 思考模式，后续请求需回传） */
+    @Column(name = "reasoning_content", columnDefinition = "TEXT")
+    private String reasoningContent;
+
     /** 所属会话ID（外键） */
     @Column(name = "conversation_id", nullable = false)
     private String conversationId;
@@ -106,6 +110,14 @@ public class ChatMessage {
 
     public void setConversationId(String conversationId) {
         this.conversationId = conversationId;
+    }
+
+    public String getReasoningContent() {
+        return reasoningContent;
+    }
+
+    public void setReasoningContent(String reasoningContent) {
+        this.reasoningContent = reasoningContent;
     }
 
     public String getImageUrl() {
