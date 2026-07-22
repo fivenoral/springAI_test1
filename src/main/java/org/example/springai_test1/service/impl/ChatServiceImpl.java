@@ -207,6 +207,15 @@ public class ChatServiceImpl implements ChatService {
         }
         logger.info("AI响应 - 模型: {}, 包含reasoning_content: {}", model, reasoningContent != null);
 
+
+        ChatResponse response = ChatClient.builder(chatModel)
+                .build().prompt()
+                .advisors(QuestionAnswerAdvisor.builder(vectorStore).build())
+                .user(userText)
+                .call()
+                .chatResponse();
+
+
         // 5. 记录 AI 回复
         ChatMessage assistantMsg = new ChatMessage("assistant", aiReply, model, convId);
         if (reasoningContent != null) {
