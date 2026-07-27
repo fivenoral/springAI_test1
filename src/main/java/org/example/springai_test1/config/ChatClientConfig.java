@@ -5,6 +5,7 @@ import com.openai.client.OpenAIClientAsync;
 import org.example.springai_test1.advisor.ReReadingAdvisor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor;
+import org.springframework.ai.chat.client.advisor.vectorstore.QuestionAnswerAdvisor;
 import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
@@ -61,9 +62,10 @@ public class ChatClientConfig {
                                        SimpleLoggerAdvisor simpleLoggerAdvisor,
                                        ReReadingAdvisor reReadingAdvisor,
                                        Object[] allToolCallbacks,
-                                       SyncMcpToolCallbackProvider mcpToolProvider) {
+                                       SyncMcpToolCallbackProvider mcpToolProvider,
+                                       QuestionAnswerAdvisor questionAnswerAdvisor) {
         return ChatClient.builder(openAiChatModel)
-                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor)
+                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor,questionAnswerAdvisor)
                 .defaultTools(allToolCallbacks)
                 .defaultToolCallbacks(mcpToolProvider.getToolCallbacks())
                 .build();
@@ -79,7 +81,8 @@ public class ChatClientConfig {
     public ChatClient deepSeekChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor,
                                          ReReadingAdvisor reReadingAdvisor,
                                          Object[] allToolCallbacks,
-                                         SyncMcpToolCallbackProvider mcpToolProvider) {
+                                         SyncMcpToolCallbackProvider mcpToolProvider,
+                                         QuestionAnswerAdvisor questionAnswerAdvisor) {
         OpenAIClient deepSeekClient = OpenAiSetup.setupSyncClient(
                 deepSeekBaseUrl, deepSeekApiKey, null, null, null, null,
                 false, false, deepSeekModel, Duration.ofSeconds(60), 0, null, null);
@@ -97,7 +100,7 @@ public class ChatClientConfig {
 
         return ChatClient.builder(chatModel)
                 /*.defaultSystem("You are a helpful assistant.")*/   //系统元数据
-                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor)
+                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor,questionAnswerAdvisor)
                 .defaultTools(allToolCallbacks)
                 .defaultToolCallbacks(mcpToolProvider.getToolCallbacks())
                 .build();
@@ -112,7 +115,8 @@ public class ChatClientConfig {
     public ChatClient qwenChatClient(SimpleLoggerAdvisor simpleLoggerAdvisor,
                                      ReReadingAdvisor reReadingAdvisor,
                                      Object[] allToolCallbacks,
-                                     SyncMcpToolCallbackProvider mcpToolProvider) {
+                                     SyncMcpToolCallbackProvider mcpToolProvider,
+                                     QuestionAnswerAdvisor questionAnswerAdvisor) {
         OpenAIClient qwenClient = OpenAiSetup.setupSyncClient(
                 qwenBaseUrl, qwenApiKey, null, null, null, null,
                 false, false, qwenModel, Duration.ofSeconds(60), 0, null, null);
@@ -129,7 +133,7 @@ public class ChatClientConfig {
                 .build();
 
         return ChatClient.builder(chatModel)
-                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor)
+                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor,questionAnswerAdvisor)
                 .defaultTools(allToolCallbacks)
                 .defaultToolCallbacks(mcpToolProvider.getToolCallbacks())
                 .build();

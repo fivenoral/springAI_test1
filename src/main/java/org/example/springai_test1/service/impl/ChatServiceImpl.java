@@ -2,6 +2,7 @@ package org.example.springai_test1.service.impl;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.openai.models.vectorstores.VectorStoreSearchParams;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.Resource;
 import org.example.springai_test1.dto.ChatResult;
@@ -21,6 +22,7 @@ import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -93,6 +95,9 @@ public class ChatServiceImpl implements ChatService {
 
     @Autowired(required = false)
     private SyncMcpToolCallbackProvider mcpToolProvider;
+
+    @Autowired
+    private VectorStore vectorStore;
 
     @PostConstruct
     public void init() {
@@ -194,7 +199,6 @@ public class ChatServiceImpl implements ChatService {
                     .user(u -> u.text(userMessage))
                     .call()
                     .chatResponse();
-
             aiReply = chatResponse.getResult().getOutput().getText();
 
             // 提取 reasoning_content（如果有）
@@ -206,14 +210,6 @@ public class ChatServiceImpl implements ChatService {
             }
         }
         logger.info("AI响应 - 模型: {}, 包含reasoning_content: {}", model, reasoningContent != null);
-
-
-        ChatResponse response = ChatClient.builder(chatModel)
-                .build().prompt()
-                .advisors(QuestionAnswerAdvisor.builder(vectorStore).build())
-                .user(userText)
-                .call()
-                .chatResponse();
 
 
         // 5. 记录 AI 回复
