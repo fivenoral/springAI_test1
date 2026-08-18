@@ -1,6 +1,7 @@
 package org.example.springai_test1.service.impl;
 
 import org.example.springai_test1.dto.DocumentUploadResult;
+import org.example.springai_test1.rag.Bm25IndexService;
 import org.example.springai_test1.service.DocumentService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,6 +45,10 @@ public class DocumentServiceImpl implements DocumentService {
     @Autowired
     private VectorStore vectorStore;
 
+    /** BM25 稀疏检索索引（Hybrid Search 的另一路），与向量库双写保持一致 */
+    @Autowired
+    private Bm25IndexService bm25IndexService;
+
     @Override
     public List<Document> convertToDocuments(MultipartFile file) throws IOException {
         if (file == null || file.isEmpty()) {
@@ -78,6 +83,9 @@ public class DocumentServiceImpl implements DocumentService {
         if (storeToVectorStore && !splitDocuments.isEmpty()) {
             vectorStore.add(splitDocuments);
             logger.info("已将 {} 个 Document 写入向量库", splitDocuments.size());
+            // 同步写入 BM25 稀疏索引，保证 Hybrid Search 两路召回内容一致
+            bm25IndexService.index(splitDocuments);
+            logger.info("已将 {} 个 Document 写入 BM25 索引", splitDocuments.size());
         }
 
         List<String> documentIds = splitDocuments.stream()

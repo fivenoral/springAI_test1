@@ -10,6 +10,7 @@ import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.openai.setup.OpenAiSetup;
+import org.springframework.ai.rag.advisor.RetrievalAugmentationAdvisor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -63,9 +64,13 @@ public class ChatClientConfig {
                                        ReReadingAdvisor reReadingAdvisor,
                                        Object[] allToolCallbacks,
                                        SyncMcpToolCallbackProvider mcpToolProvider,
-                                       QuestionAnswerAdvisor questionAnswerAdvisor) {
+                                       // 切换回纯向量检索时：改回下面注释的 QuestionAnswerAdvisor 形参，并同步 defaultAdvisors
+                                       // QuestionAnswerAdvisor questionAnswerAdvisor) {
+                                       RetrievalAugmentationAdvisor retrievalAugmentationAdvisor) {
         return ChatClient.builder(openAiChatModel)
-                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor,questionAnswerAdvisor)
+                // Hybrid Search：用 RetrievalAugmentationAdvisor（BM25+向量+RRF）替换 questionAnswerAdvisor
+                // .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor, questionAnswerAdvisor) // 旧：纯向量检索
+                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor, retrievalAugmentationAdvisor)
                 .defaultTools(allToolCallbacks)
                 .defaultToolCallbacks(mcpToolProvider.getToolCallbacks())
                 .build();
@@ -82,7 +87,9 @@ public class ChatClientConfig {
                                          ReReadingAdvisor reReadingAdvisor,
                                          Object[] allToolCallbacks,
                                          SyncMcpToolCallbackProvider mcpToolProvider,
-                                         QuestionAnswerAdvisor questionAnswerAdvisor) {
+                                         // 切换回纯向量检索时：改回下面注释的 QuestionAnswerAdvisor 形参，并同步 defaultAdvisors
+                                         // QuestionAnswerAdvisor questionAnswerAdvisor) {
+                                         RetrievalAugmentationAdvisor retrievalAugmentationAdvisor) {
         OpenAIClient deepSeekClient = OpenAiSetup.setupSyncClient(
                 deepSeekBaseUrl, deepSeekApiKey, null, null, null, null,
                 false, false, deepSeekModel, Duration.ofSeconds(60), 0, null, null);
@@ -100,7 +107,9 @@ public class ChatClientConfig {
 
         return ChatClient.builder(chatModel)
                 /*.defaultSystem("You are a helpful assistant.")*/   //系统元数据
-                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor,questionAnswerAdvisor)
+                // Hybrid Search：用 RetrievalAugmentationAdvisor（BM25+向量+RRF）替换 questionAnswerAdvisor
+                // .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor, questionAnswerAdvisor) // 旧：纯向量检索
+                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor, retrievalAugmentationAdvisor)
                 .defaultTools(allToolCallbacks)
                 .defaultToolCallbacks(mcpToolProvider.getToolCallbacks())
                 .build();
@@ -116,7 +125,9 @@ public class ChatClientConfig {
                                      ReReadingAdvisor reReadingAdvisor,
                                      Object[] allToolCallbacks,
                                      SyncMcpToolCallbackProvider mcpToolProvider,
-                                     QuestionAnswerAdvisor questionAnswerAdvisor) {
+                                     // 切换回纯向量检索时：改回下面注释的 QuestionAnswerAdvisor 形参，并同步 defaultAdvisors
+                                     // QuestionAnswerAdvisor questionAnswerAdvisor) {
+                                     RetrievalAugmentationAdvisor retrievalAugmentationAdvisor) {
         OpenAIClient qwenClient = OpenAiSetup.setupSyncClient(
                 qwenBaseUrl, qwenApiKey, null, null, null, null,
                 false, false, qwenModel, Duration.ofSeconds(60), 0, null, null);
@@ -133,7 +144,9 @@ public class ChatClientConfig {
                 .build();
 
         return ChatClient.builder(chatModel)
-                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor,questionAnswerAdvisor)
+                // Hybrid Search：用 RetrievalAugmentationAdvisor（BM25+向量+RRF）替换 questionAnswerAdvisor
+                // .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor, questionAnswerAdvisor) // 旧：纯向量检索
+                .defaultAdvisors(reReadingAdvisor, simpleLoggerAdvisor, retrievalAugmentationAdvisor)
                 .defaultTools(allToolCallbacks)
                 .defaultToolCallbacks(mcpToolProvider.getToolCallbacks())
                 .build();
