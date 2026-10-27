@@ -9,9 +9,11 @@ import org.example.springai_test1.service.ChatService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.context.request.async.DeferredResult;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.File;
@@ -22,12 +24,20 @@ import java.nio.file.Paths;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.stream.Collectors;
 
 /**
- * 聊天控制器 —— REST API
+ * 聊天控制器 —— REST API（异步化版本）
  * <p>
- * 提供对话、会话列表、清除对话等接口。
+ * 高并发优化：
+ * <ul>
+ *   <li>聊天/图像接口使用 {@link DeferredResult} + {@link CompletableFuture} 异步执行，
+ *       Tomcat 线程立即释放，AI 调用在异步线程池（虚拟线程）中执行</li>
+ *   <li>配合 {@code spring.mvc.async.request-timeout=120000} 设置异步超时</li>
+ *   <li>并发能力从「200 个 Tomcat 线程 = 200 并发」提升到「数千并发」</li>
+ * </ul>
  */
 @RestController
 @RequestMapping("/api/chat")
@@ -44,40 +54,66 @@ public class ChatController {
     @Autowired
     private ConversationRepository conversationRepository;
 
+    /** 异步任务执行器（虚拟线程），由 AsyncConfig 配置 */
+    @Autowired
+    @Qualifier("taskExecutor")
+    private Executor taskExecutor;
+
     /**
-     * 发送消息并获取 AI 回复
+     * 发送消息并获取 AI 回复（异步）
      * POST /api/chat/send
      * Body: { "model": "openai", "conversationId": "xxx", "message": "你好" }
      */
     @PostMapping("/send")
-    public ResponseEntity<Map<String, Object>> sendMessage(@RequestBody Map<String, String> request) {
+    public DeferredResult<ResponseEntity<?>> sendMessage(@RequestBody Map<String, String> request) {
+        // 异步超时 120 秒（与 AI 调用最大耗时匹配）
+        DeferredResult<ResponseEntity<?>> deferredResult = new DeferredResult<>(120_000L);
+
         String model = request.getOrDefault("model", "openai");
         String conversationId = request.get("conversationId");
         String message = request.get("message");
         boolean thinkingMode = "true".equalsIgnoreCase(request.get("thinkingMode"));
 
-        logger.info("API调用 - 发送消息: 模型={}, 会话ID={}, 消息长度={}, 思考模式={}", model, conversationId, message != null ? message.length() : 0, thinkingMode);
+        logger.info("API调用 - 发送消息: 模型={}, 会话ID={}, 消息长度={}, 思考模式={}",
+                model, conversationId, message != null ? message.length() : 0, thinkingMode);
 
         if (message == null || message.isBlank()) {
             logger.warn("API调用失败 - 消息内容为空");
-            return ResponseEntity.badRequest().body(Map.<String, Object>of("error", "消息内容不能为空"));
+            deferredResult.setResult(ResponseEntity.badRequest().body(Map.of("error", "消息内容不能为空")));
+            return deferredResult;
         }
 
-        try {
+        // 异步执行：Tomcat 线程立即释放，AI 调用在虚拟线程中执行
+        CompletableFuture.supplyAsync(() -> {
             ChatResult chatResult = chatService.chat(model, conversationId, message, thinkingMode);
-            logger.info("API调用成功 - 发送消息完成: 模型={}, 回复长度={}, 有思考过程={}", model, chatResult.reply().length(), chatResult.reasoningContent() != null);
+            logger.info("API调用成功 - 发送消息完成: 模型={}, 回复长度={}, 有思考过程={}",
+                    model, chatResult.reply().length(), chatResult.reasoningContent() != null);
 
-            Map<String, Object> response = new java.util.HashMap<>();
+            java.util.Map<String, Object> response = new java.util.HashMap<>();
             response.put("reply", chatResult.reply());
             response.put("model", model);
             if (chatResult.reasoningContent() != null) {
                 response.put("reasoningContent", chatResult.reasoningContent());
             }
-            return ResponseEntity.ok(response);
-        } catch (Exception e) {
-            logger.error("聊天请求失败 - 模型={}, 会话ID={}", model, conversationId, e);
-            return ResponseEntity.internalServerError().body(Map.<String, Object>of("error", "聊天请求失败: " + e.getMessage()));
-        }
+            return ResponseEntity.ok((Object) response);
+        }, taskExecutor).whenComplete((response, throwable) -> {
+            if (throwable != null) {
+                logger.error("聊天请求失败 - 模型={}, 会话ID={}", model, conversationId, throwable);
+                deferredResult.setResult(ResponseEntity.internalServerError()
+                        .body(Map.of("error", "聊天请求失败: " + throwable.getMessage())));
+            } else {
+                deferredResult.setResult(response);
+            }
+        });
+
+        // 异步超时回调
+        deferredResult.onTimeout(() -> {
+            logger.warn("聊天请求超时 - 模型={}, 会话ID={}", model, conversationId);
+            deferredResult.setResult(ResponseEntity.status(504)
+                    .body(Map.of("error", "AI 响应超时，请稍后重试")));
+        });
+
+        return deferredResult;
     }
 
     /**
@@ -166,15 +202,16 @@ public class ChatController {
         return ResponseEntity.ok(Map.of("message", "所有对话已清除"));
     }
 
-    // ==================== 图片处理接口 ====================
+    // ==================== 图片处理接口（异步） ====================
 
     /**
-     * 生成图片
+     * 生成图片（异步）
      * POST /api/chat/generate-image
-     * Body: { "prompt": "一只可爱的猫", "conversationId": "xxx" }
      */
     @PostMapping("/generate-image")
-    public ResponseEntity<Map<String, String>> generateImage(@RequestBody Map<String, String> request) {
+    public DeferredResult<ResponseEntity<?>> generateImage(@RequestBody Map<String, String> request) {
+        DeferredResult<ResponseEntity<?>> deferredResult = new DeferredResult<>(120_000L);
+
         String prompt = request.get("prompt");
         String conversationId = request.get("conversationId");
         String size = request.getOrDefault("size", "1024*1024");
@@ -182,74 +219,101 @@ public class ChatController {
         logger.info("API调用 - 生成图片: 提示词={}, 会话ID={}, 尺寸={}", prompt, conversationId, size);
 
         if (prompt == null || prompt.isBlank()) {
-            logger.warn("API调用失败 - 提示词为空");
-            return ResponseEntity.badRequest().body(Map.of("error", "提示词不能为空"));
+            deferredResult.setResult(ResponseEntity.badRequest().body(Map.of("error", "提示词不能为空")));
+            return deferredResult;
         }
 
-        try {
+        CompletableFuture.supplyAsync(() -> {
             String imageUrl = chatService.generateImage(prompt, conversationId, size);
             logger.info("API调用成功 - 生成图片完成: 图片URL={}", imageUrl);
-            return ResponseEntity.ok(Map.of("imageUrl", imageUrl, "prompt", prompt));
-        } catch (Exception e) {
-            logger.error("图片生成失败", e);
-            return ResponseEntity.internalServerError().body(Map.of("error", "图片生成失败: " + e.getMessage()));
-        }
+            return ResponseEntity.ok((Object) Map.of("imageUrl", imageUrl, "prompt", prompt));
+        }, taskExecutor).whenComplete((response, throwable) -> {
+            if (throwable != null) {
+                logger.error("图片生成失败", throwable);
+                deferredResult.setResult(ResponseEntity.internalServerError()
+                        .body(Map.of("error", "图片生成失败: " + throwable.getMessage())));
+            } else {
+                deferredResult.setResult((ResponseEntity<?>) response);
+            }
+        });
+
+        return deferredResult;
     }
 
     /**
-     * 编辑图片
+     * 编辑图片（异步）
      * POST /api/chat/edit-image
-     * Content-Type: multipart/form-data
-     * Parameters: prompt, conversationId, image (file)
      */
     @PostMapping(value = "/edit-image", consumes = "multipart/form-data")
-    public ResponseEntity<Map<String, String>> editImage(
+    public DeferredResult<ResponseEntity<?>> editImage(
             @RequestParam(value = "prompt") String prompt,
             @RequestParam(value = "conversationId", required = false) String conversationId,
             @RequestParam("image") MultipartFile image) {
+
+        DeferredResult<ResponseEntity<?>> deferredResult = new DeferredResult<>(120_000L);
 
         logger.info("API调用 - 编辑图片: 提示词={}, 会话ID={}, 文件名={}, 大小={}",
                 prompt, conversationId, image.getOriginalFilename(), image.getSize());
 
         if (image.isEmpty()) {
-            return ResponseEntity.badRequest().body(Map.of("error", "图片不能为空"));
+            deferredResult.setResult(ResponseEntity.badRequest().body(Map.of("error", "图片不能为空")));
+            return deferredResult;
         }
 
         if (prompt == null || prompt.isBlank()) {
-            return ResponseEntity.badRequest().body(Map.of("error", "编辑提示词不能为空"));
+            deferredResult.setResult(ResponseEntity.badRequest().body(Map.of("error", "编辑提示词不能为空")));
+            return deferredResult;
         }
 
+        // 同步保存原始图片（毫秒级 IO，无需异步）
+        final String originalImageUrl;
         try {
-            // 先保存图片文件（用于前端显示原始图片）
-            String originalImageUrl = saveImage(image);
+            originalImageUrl = saveImage(image);
             logger.info("原始图片已保存, URL: {}", originalImageUrl);
+        } catch (IOException e) {
+            logger.error("图片保存失败", e);
+            deferredResult.setResult(ResponseEntity.internalServerError()
+                    .body(Map.of("error", "图片保存失败: " + e.getMessage())));
+            return deferredResult;
+        }
 
-            // 调用图片编辑服务
-            String editedImageUrl = chatService.editImage(prompt, conversationId, image.getBytes(), originalImageUrl);
+        // 异步执行图片编辑（AI 调用，耗时较长）
+        final byte[] imageData;
+        try {
+            imageData = image.getBytes();
+        } catch (IOException e) {
+            deferredResult.setResult(ResponseEntity.internalServerError()
+                    .body(Map.of("error", "读取图片数据失败: " + e.getMessage())));
+            return deferredResult;
+        }
 
-            return ResponseEntity.ok(Map.of(
+        CompletableFuture.supplyAsync(() -> {
+            String editedImageUrl = chatService.editImage(prompt, conversationId, imageData, originalImageUrl);
+            return ResponseEntity.ok((Object) Map.of(
                     "editedImageUrl", editedImageUrl,
                     "originalImageUrl", originalImageUrl,
                     "prompt", prompt
             ));
-        } catch (IOException e) {
-            logger.error("图片保存失败", e);
-            return ResponseEntity.internalServerError().body(Map.of("error", "图片保存失败: " + e.getMessage()));
-        } catch (Exception e) {
-            logger.error("图片编辑失败", e);
-            return ResponseEntity.internalServerError().body(Map.of("error", "图片编辑失败: " + e.getMessage()));
-        }
+        }, taskExecutor).whenComplete((response, throwable) -> {
+            if (throwable != null) {
+                logger.error("图片编辑失败", throwable);
+                deferredResult.setResult(ResponseEntity.internalServerError()
+                        .body(Map.of("error", "图片编辑失败: " + throwable.getMessage())));
+            } else {
+                deferredResult.setResult((ResponseEntity<?>) response);
+            }
+        });
+
+        return deferredResult;
     }
 
     /**
      * 保存图片文件并返回可访问的URL
      */
     private String saveImage(MultipartFile image) throws IOException {
-        // 确保上传目录存在
         Path uploadPath = Paths.get(uploadDir).toAbsolutePath();
         Files.createDirectories(uploadPath);
 
-        // 生成唯一文件名
         String originalFilename = image.getOriginalFilename();
         String extension = "";
         if (originalFilename != null && originalFilename.contains(".")) {
@@ -257,12 +321,10 @@ public class ChatController {
         }
         String filename = UUID.randomUUID().toString() + extension;
 
-        // 保存文件（使用 Files.copy 避免 transferTo 临时文件路径问题）
         Path filePath = uploadPath.resolve(filename);
         Files.copy(image.getInputStream(), filePath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         logger.info("图片保存到: {}", filePath);
 
-        // 返回可访问的URL（通过静态资源映射）
         return "/uploads/" + filename;
     }
 
@@ -274,11 +336,10 @@ public class ChatController {
         dto.setModel(conversation.getModel());
         dto.setCreatedAt(conversation.getCreatedAt());
 
-        // 从Repository获取消息
-        List<org.example.springai_test1.model.ChatMessage> messages = 
-            conversationRepository.findMessagesByConversationId(conversationId);
+        List<org.example.springai_test1.model.ChatMessage> messages =
+                conversationRepository.findMessagesByConversationId(conversationId);
 
-        List<org.example.springai_test1.dto.ChatMessageDTO> messageDTOs = messages.stream()
+        List<ChatMessageDTO> messageDTOs = messages.stream()
                 .map(this::toMessageDTO)
                 .collect(Collectors.toList());
         dto.setMessages(messageDTOs);

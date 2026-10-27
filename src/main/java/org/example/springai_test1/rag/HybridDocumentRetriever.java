@@ -13,10 +13,18 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * 混合检索器（Hybrid Search）：并行执行稠密向量检索与 BM25 稀疏检索，
  * 再用 RRF（Reciprocal Rank Fusion，倒数排名融合）算法融合两路结果。
+ * <p>
+ * 高并发优化：
+ * <ul>
+ *   <li>向量检索和 BM25 检索通过 {@link CompletableFuture} 并行执行，
+ *       总耗时从「向量 + BM25」降为「max(向量, BM25)」</li>
+ *   <li>使用 ForkJoinPool.commonPool() 作为默认并行执行器</li>
+ * </ul>
  * <p>
  * RRF 打分公式：{@code score(d) = Σ_i 1 / (k + rank_i(d))}，其中：
  * <ul>
@@ -24,11 +32,6 @@ import java.util.Map;
  *   <li>{@code k} 为平滑常数，业界惯例取 60，用于削弱头部名次的过度主导；</li>
  *   <li>同时命中两路的文档分数叠加，因此更容易进入最终 top-K。</li>
  * </ul>
- * 跨通道以 Document id 作为去重/合并键；向量通道命中的 Document 保留其原始 metadata 与 score，
- * 仅在 BM25 单独命中时才根据 Lucene 存储字段重建 Document。
- * <p>
- * 实现 Spring AI 模块化 RAG 的 {@link DocumentRetriever}，可直接挂到
- * {@code RetrievalAugmentationAdvisor} 上。
  */
 public class HybridDocumentRetriever implements DocumentRetriever {
 
@@ -67,16 +70,25 @@ public class HybridDocumentRetriever implements DocumentRetriever {
     public List<Document> retrieve(Query query) {
         String queryText = query.text();
 
-        // ---------- 1. 稠密向量通道 ----------
-        List<Document> vectorHits = vectorSearch(queryText);
+        // ---------- 1. 并行执行向量检索 + BM25 检索（高并发优化核心） ----------
+        CompletableFuture<List<Document>> vectorFuture = CompletableFuture.supplyAsync(() -> vectorSearch(queryText));
+        CompletableFuture<List<Bm25IndexService.Bm25Hit>> bm25Future = CompletableFuture.supplyAsync(
+                () -> bm25IndexService.search(queryText, bm25TopN));
 
-        // ---------- 2. BM25 稀疏通道 ----------
-        List<Bm25IndexService.Bm25Hit> bm25Hits = bm25IndexService.search(queryText, bm25TopN);
+        List<Document> vectorHits;
+        List<Bm25IndexService.Bm25Hit> bm25Hits;
+        try {
+            // 等待两路检索都完成
+            CompletableFuture.allOf(vectorFuture, bm25Future).join();
+            vectorHits = vectorFuture.get();
+            bm25Hits = bm25Future.get();
+        } catch (Exception e) {
+            logger.warn("混合检索并行执行异常，降级为空结果: {}", e.getMessage());
+            return List.of();
+        }
 
-        // ---------- 3. RRF 融合 ----------
-        // 保存每个 id 对应的 Document（优先向量通道的实例，含 metadata/score）
+        // ---------- 2. RRF 融合 ----------
         Map<String, Document> docById = new LinkedHashMap<>();
-        // 累计每个 id 的 RRF 分数
         Map<String, Double> rrfScore = new LinkedHashMap<>();
 
         for (int rank = 0; rank < vectorHits.size(); rank++) {
@@ -86,7 +98,6 @@ public class HybridDocumentRetriever implements DocumentRetriever {
         }
         for (int rank = 0; rank < bm25Hits.size(); rank++) {
             Bm25IndexService.Bm25Hit hit = bm25Hits.get(rank);
-            // BM25 单独命中且向量通道没有时，用 Lucene 存储字段重建 Document
             docById.computeIfAbsent(hit.id(), id -> Document.builder()
                     .id(id)
                     .text(hit.content())
@@ -94,21 +105,32 @@ public class HybridDocumentRetriever implements DocumentRetriever {
             accumulate(rrfScore, hit.id(), rank);
         }
 
-        // ---------- 4. 按融合分降序取 top-K ----------
+        // ---------- 3. 按融合分降序取 top-K ----------
         List<Document> fused = rrfScore.entrySet().stream()
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
                 .limit(finalTopK)
                 .map(e -> docById.get(e.getKey()))
                 .collect(ArrayList::new, ArrayList::add, ArrayList::addAll);
-
-        logger.info("Hybrid 检索: 向量命中 {} 条, BM25 命中 {} 条, RRF 融合后返回 {} 条",
+        
+        logger.info("Hybrid 检索（并行）: 向量命中 {} 条，BM25 命中 {} 条，RRF 融合后返回 {} 条", 
                 vectorHits.size(), bm25Hits.size(), fused.size());
+                
+        // 输出检索到的文档详情（用于调试）
+        if (!fused.isEmpty()) {
+            logger.info("===== 检索到的前 {} 个文档 =====", fused.size());
+            for (int i = 0; i < Math.min(3, fused.size()); i++) {
+                Document doc = fused.get(i);
+                String preview = doc.getText().length() > 200 ? 
+                        doc.getText().substring(0, 200) + "..." : doc.getText();
+                logger.info("  [{}] ID: {}, 文本预览：{}", i + 1, doc.getId(), preview);
+            }
+        }
+        logger.info("==============================");
         return fused;
     }
 
     /**
-     * 执行向量检索，复用原 QuestionAnswerAdvisor 的 SearchRequest 语义
-     * （topK / similarityThreshold / filterExpression）。
+     * 执行向量检索
      */
     private List<Document> vectorSearch(String queryText) {
         SearchRequest.Builder builder = SearchRequest.builder()

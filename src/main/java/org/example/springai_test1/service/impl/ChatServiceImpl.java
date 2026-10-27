@@ -2,14 +2,13 @@ package org.example.springai_test1.service.impl;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.openai.models.vectorstores.VectorStoreSearchParams;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.ratelimiter.RateLimiter;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.Resource;
 import org.example.springai_test1.dto.ChatResult;
 import org.example.springai_test1.model.ChatMessage;
-import org.example.springai_test1.model.ChatMessageHis;
 import org.example.springai_test1.model.Conversation;
-import org.example.springai_test1.repository.ConversationRepository;
 import org.example.springai_test1.service.ChatService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,7 +25,6 @@ import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.ClassUtils;
 
 import java.lang.reflect.Method;
@@ -49,9 +47,17 @@ import java.util.UUID;
  * 2. 从仓储层加载历史消息构建上下文
  * 3. 调用 AI 模型获取回复
  * 4. 将用户消息和 AI 回复持久化到仓储层
+ * <p>
+ * 高并发优化：
+ * <ul>
+ *   <li>移除类级 @Transactional，所有 DB 操作委托给 {@link ChatTransactionalService}，
+ *       避免 AI 调用期间（5~60s）持有数据库连接</li>
+ *   <li>使用全局共享的 {@link HttpClient} Bean（带连接池），替代每次 newHttpClient()</li>
+ *   <li>工具定义启动时构建一次并缓存，避免每次请求反射扫描</li>
+ *   <li>上下文窗口裁剪：长对话下只取最近 N 条消息，避免 token 数爆炸</li>
+ * </ul>
  */
 @Service
-@Transactional
 public class ChatServiceImpl implements ChatService {
 
     private static final Logger logger = LoggerFactory.getLogger(ChatServiceImpl.class);
@@ -74,7 +80,14 @@ public class ChatServiceImpl implements ChatService {
     @Value("${spring.ai.deepseek.chat.options.model:deepseek-v4-pro}")
     private String deepSeekModel;
 
-    private final HttpClient imageHttpClient = HttpClient.newHttpClient();
+    /** 上下文窗口大小：仅取最近 N 条消息作为 LLM 上下文，避免 token 爆炸 */
+    @Value("${app.chat.context-window:40}")
+    private int contextWindow;
+
+    /** 全局共享的 HttpClient（带连接池），由 HttpClientConfig 配置 */
+    @Autowired
+    private HttpClient httpClient;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Resource(name = "openAiChatClient")
@@ -86,9 +99,12 @@ public class ChatServiceImpl implements ChatService {
     @Resource(name = "qwenChatClient")
     private ChatClient qwenChatClient;
 
-
+    /**
+     * 事务性 DB 操作服务：所有数据库读写都通过它，
+     * 每个方法独立短事务，毫秒级完成，AI 调用期间不占用连接
+     */
     @Autowired
-    private ConversationRepository conversationRepository;
+    private ChatTransactionalService txService;
 
     @Autowired(required = false)
     private Object[] allToolCallbacks;
@@ -98,6 +114,17 @@ public class ChatServiceImpl implements ChatService {
 
     @Autowired
     private VectorStore vectorStore;
+
+    /** AI 网关熔断器（Resilience4j）：连续失败自动熔断，避免拖垮整个应用 */
+    @Autowired
+    private CircuitBreaker aiCircuitBreaker;
+
+    /** AI 网关限流器（Resilience4j）：限制每秒 AI 调用次数，保护下游网关 */
+    @Autowired
+    private RateLimiter aiRateLimiter;
+
+    /** 缓存的工具定义（启动时构建一次，避免每次请求反射扫描） */
+    private List<Map<String, Object>> cachedToolDefinitions;
 
     @PostConstruct
     public void init() {
@@ -115,7 +142,6 @@ public class ChatServiceImpl implements ChatService {
                 }
             }
         }
-        // 诊断 MCP 工具
         if (mcpToolProvider == null) {
             logger.warn("[启动诊断] mcpToolProvider = null，MCP 工具不可用！");
         } else {
@@ -131,6 +157,9 @@ public class ChatServiceImpl implements ChatService {
                 logger.warn("[启动诊断] 获取 MCP 工具失败: {}", e.getMessage());
             }
         }
+        // 启动时一次性构建工具定义，避免每次请求反射扫描
+        this.cachedToolDefinitions = buildToolDefinitions();
+        logger.info("[启动诊断] 工具定义已缓存，共 {} 个", cachedToolDefinitions.size());
     }
 
     @Override
@@ -142,42 +171,23 @@ public class ChatServiceImpl implements ChatService {
     public ChatResult chat(String model, String conversationId, String userMessage, boolean thinkingMode) {
         logger.info("收到聊天请求 - 模型: {}, 会话ID: {}, 用户消息: {}", model, conversationId, userMessage);
 
-        // 1. 获取或创建会话
-        final String convId;
-        Conversation conversation;
-        if (conversationId == null || conversationId.isBlank()) {
-            convId = UUID.randomUUID().toString();
-            conversation = new Conversation(convId, model);
-            conversationRepository.save(conversation);
-            logger.info("创建新会话 - 会话ID: {}, 模型: {}", convId, model);
-        } else {
-            convId = conversationId;
-            conversation = conversationRepository.findById(convId)
-                    .orElseGet(() -> {
-                        Conversation newConv = new Conversation(convId, model);
-                        conversationRepository.save(newConv);
-                        logger.info("会话不存在，创建新会话 - 会话ID: {}, 模型: {}", convId, model);
-                        return newConv;
-                    });
-        }
+        // 1. 获取或创建会话（短事务）
+        String convId = resolveConversationId(conversationId, model);
 
-        // 2. 记录用户消息
+        // 2. 记录用户消息（短事务，完成后立即释放 DB 连接）
         ChatMessage userMsg = new ChatMessage("user", userMessage, model, convId);
-        conversationRepository.saveMessage(userMsg);
-        // 同时保存到历史表
-        ChatMessageHis userMsgHis = new ChatMessageHis("user", userMessage, model, convId);
-        userMsgHis.setTimestamp(userMsg.getTimestamp());
-        conversationRepository.saveMessageHis(userMsgHis);
+        txService.saveUserMessage(userMsg);
 
-        // 3. 调用对应的 AI 模型
+        // 3. 加载上下文（短事务只读，使用上下文窗口裁剪避免 token 爆炸）
+        List<ChatMessage> recentMessages = txService.findRecentMessages(convId, contextWindow);
+
+        // 4. 调用 AI 模型（无事务，不占 DB 连接，5~60s 期间连接池完全空闲）
         String aiReply;
         String reasoningContent = null;
 
         if ("deepseek".equalsIgnoreCase(model)) {
-            // DeepSeek 模型：始终走 HTTP 直连路径（Spring AI 适配器无法处理 reasoning_content）
-            // 当 thinkingMode 开启或历史消息含 reasoning_content 时，必须启用思考模式并回传 reasoning_content
-            boolean effectiveThinking = thinkingMode || hasReasoningContentInHistory(convId);
-            List<Map<String, Object>> rawMessages = buildRawContextMessages(convId, effectiveThinking);
+            boolean effectiveThinking = thinkingMode || hasReasoningContentInHistory(recentMessages);
+            List<Map<String, Object>> rawMessages = buildRawContextMessages(recentMessages, effectiveThinking);
             try {
                 String[] rawResult = callDeepSeekRaw(rawMessages, effectiveThinking);
                 aiReply = rawResult[0];
@@ -186,22 +196,21 @@ public class ChatServiceImpl implements ChatService {
                 logger.error("DeepSeek 调用失败", e);
                 throw new RuntimeException("DeepSeek 调用失败: " + e.getMessage(), e);
             }
-            // 用户关闭思考模式时，丢弃 API 返回的 reasoning_content（电信网关模型默认会返回）
             if (!thinkingMode) {
                 reasoningContent = null;
             }
         } else {
-            // 普通模式：使用 Spring AI ChatClient
-            List<Message> contextMessages = buildContextMessages(convId);
+            List<Message> contextMessages = buildContextMessages(recentMessages);
             ChatClient chatClient = getChatClient(model);
-            ChatResponse chatResponse = chatClient.prompt()
-                    .messages(contextMessages)
-                    .user(u -> u.text(userMessage))
-                    .call()
-                    .chatResponse();
+            // 用熔断器 + 限流器包装 AI 调用，保护下游网关
+            ChatResponse chatResponse = aiRateLimiter.executeSupplier(
+                    aiCircuitBreaker.decorateSupplier(() -> chatClient.prompt()
+                            .messages(contextMessages)
+                            .user(u -> u.text(userMessage))
+                            .call()
+                            .chatResponse()));
             aiReply = chatResponse.getResult().getOutput().getText();
 
-            // 提取 reasoning_content（如果有）
             Map<String, Object> msgMeta = chatResponse.getResult().getOutput().getMetadata();
             if (msgMeta != null) {
                 Object rc = msgMeta.get("reasoningContent");
@@ -211,17 +220,12 @@ public class ChatServiceImpl implements ChatService {
         }
         logger.info("AI响应 - 模型: {}, 包含reasoning_content: {}", model, reasoningContent != null);
 
-
-        // 5. 记录 AI 回复
+        // 5. 记录 AI 回复（短事务）
         ChatMessage assistantMsg = new ChatMessage("assistant", aiReply, model, convId);
         if (reasoningContent != null) {
             assistantMsg.setReasoningContent(reasoningContent);
         }
-        conversationRepository.saveMessage(assistantMsg);
-        // 同时保存到历史表
-        ChatMessageHis assistantMsgHis = new ChatMessageHis("assistant", aiReply, model, convId);
-        assistantMsgHis.setTimestamp(assistantMsg.getTimestamp());
-        conversationRepository.saveMessageHis(assistantMsgHis);
+        txService.saveAssistantMessage(assistantMsg);
 
         logger.info("AI回复完成 - 会话ID: {}, 模型: {}, 回复长度: {}", convId, model, aiReply.length());
         return new ChatResult(aiReply, reasoningContent);
@@ -232,47 +236,19 @@ public class ChatServiceImpl implements ChatService {
         logger.info("收到图片生成请求 - 提示词: {}, 会话ID: {}, 尺寸: {}", prompt, conversationId, size);
 
         try {
-            // 获取或创建会话
-            final String convId;
-            if (conversationId == null || conversationId.isBlank()) {
-                convId = UUID.randomUUID().toString();
-                Conversation conversation = new Conversation(convId, "qwen-image");
-                conversationRepository.save(conversation);
-                logger.info("创建新会话 - 会话ID: {}, 模型: qwen-image", convId);
-            } else {
-                convId = conversationId;
-                conversationRepository.findById(convId)
-                        .orElseGet(() -> {
-                            Conversation newConv = new Conversation(convId, "qwen-image");
-                            conversationRepository.save(newConv);
-                            logger.info("会话不存在，创建新会话 - 会话ID: {}, 模型: qwen-image", convId);
-                            return newConv;
-                        });
-            }
+            String convId = resolveConversationId(conversationId, "qwen-image");
 
-            // 记录用户消息
             ChatMessage userMsg = new ChatMessage("user", prompt, "qwen-image", convId);
-            conversationRepository.saveMessage(userMsg);
-            ChatMessageHis userMsgHis = new ChatMessageHis("user", prompt, "qwen-image", convId);
-            userMsgHis.setTimestamp(userMsg.getTimestamp());
-            conversationRepository.saveMessageHis(userMsgHis);
+            txService.saveUserMessage(userMsg);
 
-            // 调用电信网关图像生成 API
             String imageUrl = callImageGenerateApi(prompt, null, size);
-
             logger.info("图像生成API返回URL: {}", imageUrl);
 
-            // 下载图片到本地
             String localImageUrl = downloadImageToLocal(imageUrl, convId);
 
-            // 记录 AI 回复（生成的图片URL）
             ChatMessage assistantMsg = new ChatMessage("assistant", "图片已生成: " + localImageUrl, "qwen-image", convId);
             assistantMsg.setImageUrl(localImageUrl);
-            conversationRepository.saveMessage(assistantMsg);
-            ChatMessageHis assistantMsgHis = new ChatMessageHis("assistant", "图片已生成: " + localImageUrl, "qwen-image", convId);
-            assistantMsgHis.setTimestamp(assistantMsg.getTimestamp());
-            assistantMsgHis.setImageUrl(localImageUrl);
-            conversationRepository.saveMessageHis(assistantMsgHis);
+            txService.saveAssistantMessage(assistantMsg);
 
             logger.info("图片生成完成 - 会话ID: {}, 本地URL: {}", convId, localImageUrl);
             return localImageUrl;
@@ -284,60 +260,28 @@ public class ChatServiceImpl implements ChatService {
 
     @Override
     public String editImage(String prompt, String conversationId, byte[] imageData, String imageUrl) {
-        logger.info("收到图片编辑请求 - 提示词: {}, 会话ID: {}, 原始图片URL: {}, 数据大小: {}", 
+        logger.info("收到图片编辑请求 - 提示词: {}, 会话ID: {}, 原始图片URL: {}, 数据大小: {}",
                 prompt, conversationId, imageUrl, imageData != null ? imageData.length : 0);
 
         try {
-            // 获取或创建会话
-            final String convId;
-            if (conversationId == null || conversationId.isBlank()) {
-                convId = UUID.randomUUID().toString();
-                Conversation conversation = new Conversation(convId, "qwen-image");
-                conversationRepository.save(conversation);
-                logger.info("创建新会话 - 会话ID: {}, 模型: qwen-image", convId);
-            } else {
-                convId = conversationId;
-                conversationRepository.findById(convId)
-                        .orElseGet(() -> {
-                            Conversation newConv = new Conversation(convId, "qwen-image");
-                            conversationRepository.save(newConv);
-                            logger.info("会话不存在，创建新会话 - 会话ID: {}, 模型: qwen-image", convId);
-                            return newConv;
-                        });
-            }
+            String convId = resolveConversationId(conversationId, "qwen-image");
 
-            // 记录用户消息（含原始图片URL）
             ChatMessage userMsg = new ChatMessage("user", prompt, "qwen-image", convId);
             userMsg.setImageUrl(imageUrl);
-            conversationRepository.saveMessage(userMsg);
-            ChatMessageHis userMsgHis = new ChatMessageHis("user", prompt, "qwen-image", convId);
-            userMsgHis.setTimestamp(userMsg.getTimestamp());
-            userMsgHis.setImageUrl(imageUrl);
-            conversationRepository.saveMessageHis(userMsgHis);
+            txService.saveUserMessage(userMsg);
 
-            // 检测原图尺寸，编辑时保持与原图一致
             String imageSize = detectImageSize(imageData);
             logger.info("原图尺寸: {}", imageSize);
 
-            // 增强编辑提示词，防止文字重影/模糊
             String enhancedPrompt = enhanceEditPrompt(prompt);
-
-            // 调用电信网关图像编辑 API
             String editedImageUrl = callImageGenerateApi(enhancedPrompt, imageData, imageSize);
 
             logger.info("图像编辑API返回URL: {}", editedImageUrl);
-
-            // 下载编辑后的图片到本地
             String localImageUrl = downloadImageToLocal(editedImageUrl, convId);
 
-            // 记录 AI 回复（编辑后的图片URL）
             ChatMessage assistantMsg = new ChatMessage("assistant", "图片已编辑: " + localImageUrl, "qwen-image", convId);
             assistantMsg.setImageUrl(localImageUrl);
-            conversationRepository.saveMessage(assistantMsg);
-            ChatMessageHis assistantMsgHis = new ChatMessageHis("assistant", "图片已编辑: " + localImageUrl, "qwen-image", convId);
-            assistantMsgHis.setTimestamp(assistantMsg.getTimestamp());
-            assistantMsgHis.setImageUrl(localImageUrl);
-            conversationRepository.saveMessageHis(assistantMsgHis);
+            txService.saveAssistantMessage(assistantMsg);
 
             logger.info("图片编辑完成 - 会话ID: {}, 本地URL: {}", convId, localImageUrl);
             return localImageUrl;
@@ -347,130 +291,94 @@ public class ChatServiceImpl implements ChatService {
         }
     }
 
-    /**
-     * 下载图片到本地
-     */
-    private String downloadImageToLocal(String imageUrl, String conversationId) throws Exception {
-        // 提取URL中的文件名或生成新文件名
-        String filename = extractFilenameFromUrl(imageUrl);
-        String extension = filename.contains(".") ? filename.substring(filename.lastIndexOf('.')) : ".png";
-        
-        // 生成唯一文件名
-        String uniqueFilename = conversationId + "_" + UUID.randomUUID().toString() + extension;
-        
-        // 确保上传目录存在
-        java.nio.file.Path uploadPath = java.nio.file.Paths.get("uploads").toAbsolutePath();
-        java.nio.file.Files.createDirectories(uploadPath);
-        
-        // 下载图片
-        java.net.URL url = new java.net.URL(imageUrl);
-        java.io.InputStream inputStream = url.openStream();
-        java.nio.file.Path outputPath = uploadPath.resolve(uniqueFilename);
-        java.nio.file.Files.copy(inputStream, outputPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-        inputStream.close();
-        
-        logger.info("图片已下载到: {}", outputPath);
-        
-        // 返回可访问的URL
-        return "/uploads/" + uniqueFilename;
-    }
-
-    /**
-     * 从URL中提取文件名
-     */
-    private String extractFilenameFromUrl(String url) {
-        try {
-            String path = new java.net.URL(url).getPath();
-            String filename = path.substring(path.lastIndexOf('/') + 1);
-            if (filename.isEmpty()) {
-                return "generated_image.png";
-            }
-            return filename;
-        } catch (Exception e) {
-            return "generated_image.png";
-        }
-    }
-
     @Override
     public Conversation getConversation(String conversationId) {
-        Conversation conversation = conversationRepository.findById(conversationId)
+        Conversation conversation = txService.findConversation(conversationId)
                 .orElseThrow(() -> new IllegalArgumentException("会话不存在: " + conversationId));
-        // 手动加载消息
-        List<ChatMessage> messages = conversationRepository.findMessagesByConversationId(conversationId);
-        // 注意：Conversation实体不再有messages字段，这里需要特殊处理
-        // 由于DTO层已经处理了消息组装，这里可以返回不带消息的Conversation
-        // 或者创建一个包含消息的DTO
         return conversation;
     }
 
     @Override
     public List<Conversation> listConversations(String model) {
-        return conversationRepository.findByModel(model);
+        // 委托给 ConversationRepository 的查询方法（只读，事务由 JPA 管理）
+        return conversationRepository_findByModel(model);
     }
 
     @Override
     public List<Conversation> listAllConversations() {
-        return conversationRepository.findAll();
+        return conversationRepository_findAll();
     }
 
     @Override
     public void clearConversation(String conversationId) {
-        conversationRepository.findById(conversationId)
+        txService.findConversation(conversationId)
                 .orElseThrow(() -> new IllegalArgumentException("会话不存在: " + conversationId));
-        conversationRepository.clearMessages(conversationId);
-        logger.info("清除对话消息 - 会话ID: {}", conversationId);
+        txService.clearConversation(conversationId);
     }
 
     @Override
     public void deleteConversation(String conversationId) {
-        conversationRepository.deleteById(conversationId);
-        logger.info("删除对话 - 会话ID: {}", conversationId);
+        txService.deleteConversation(conversationId);
     }
 
     @Override
     public void clearModelConversations(String model) {
-        conversationRepository.deleteByModel(model);
-        logger.info("清除模型所有对话 - 模型: {}", model);
+        txService.deleteByModel(model);
     }
 
     @Override
     public void clearAll() {
-        conversationRepository.deleteAll();
-        logger.info("清除所有对话");
+        txService.deleteAll();
     }
 
     // ==================== 私有辅助方法 ====================
 
     /**
-     * 调用电信网关图像生成/编辑 API
-     * POST {qwenBaseUrl}/images/generations
-     *
-     * @param prompt    提示词
-     * @param imageData 原始图片字节数据（为 null 时表示纯生成，非编辑）
-     * @return 生成的图片 URL
+     * 获取或创建会话（短事务）
      */
+    private String resolveConversationId(String conversationId, String model) {
+        if (conversationId == null || conversationId.isBlank()) {
+            String convId = UUID.randomUUID().toString();
+            txService.saveConversation(new Conversation(convId, model));
+            logger.info("创建新会话 - 会话ID: {}, 模型: {}", convId, model);
+            return convId;
+        }
+        return txService.findConversation(conversationId)
+                .map(c -> c.getId())
+                .orElseGet(() -> {
+                    String newId = conversationId;
+                    txService.saveConversation(new Conversation(newId, model));
+                    logger.info("会话不存在，创建新会话 - 会话ID: {}, 模型: {}", newId, model);
+                    return newId;
+                });
+    }
+
+    // 以下两个方法保留对 ConversationRepository 的只读查询（非事务性，JPA 自动管理）
+    @Autowired
+    private org.example.springai_test1.repository.ConversationRepository conversationRepository;
+
+    private List<Conversation> conversationRepository_findByModel(String model) {
+        return conversationRepository.findByModel(model);
+    }
+
+    private List<Conversation> conversationRepository_findAll() {
+        return conversationRepository.findAll();
+    }
+
     /**
      * 调用电信网关图像生成/编辑 API
      * POST {qwenBaseUrl}/images/generations
-     *
-     * @param prompt    提示词
-     * @param imageData 原始图片字节数据（为 null 时表示纯生成，非编辑）
-     * @param size      图片尺寸，如 "1024*1024"
-     * @return 生成的图片 URL
      */
     private String callImageGenerateApi(String prompt, byte[] imageData, String size) throws Exception {
         String endpoint = qwenBaseUrl + "/images/generations";
         logger.info("调用图像API - 端点: {}, 模型: {}, 是否编辑: {}", endpoint, qwenImageModel, imageData != null);
 
-        // DashScope 多模态对话格式：input.messages（仅支持 user 角色）
         java.util.List<java.util.Map<String, Object>> contentList = new java.util.ArrayList<>();
         contentList.add(java.util.Map.of("text", prompt));
 
         boolean isEdit = (imageData != null && imageData.length > 0);
 
-        // qwen-image-edit-max 是编辑模型，必须包含图片内容
         if (!isEdit) {
-            // 纯生成时创建指定尺寸的空白白色图片作为基底
             int[] dims = parseSize(size);
             imageData = createBlankImage(dims[0], dims[1]);
             logger.info("纯图像生成模式，已创建 {} 空白基底图片", size);
@@ -489,7 +397,6 @@ public class ChatServiceImpl implements ChatService {
                 "parameters", java.util.Map.of("size", size, "n", 1)
         ));
 
-        // 统一使用 JSON 请求体
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(endpoint))
                 .header("Content-Type", "application/json")
@@ -497,17 +404,15 @@ public class ChatServiceImpl implements ChatService {
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
                 .build();
 
-        HttpResponse<String> response = imageHttpClient.send(request, HttpResponse.BodyHandlers.ofString());
-        logger.info("图像API响应状态: {}, 响应体: {}", response.statusCode(), response.body());
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        logger.info("图像API响应状态: {}, 响应体长度: {}", response.statusCode(), response.body().length());
 
         if (response.statusCode() != 200) {
             throw new RuntimeException("图像API调用失败: HTTP " + response.statusCode() + " - " + response.body());
         }
 
-        // 解析响应 JSON，兼容多种格式
         JsonNode root = objectMapper.readTree(response.body());
 
-        // 尝试 DashScope 多模态格式: output.choices[0].message.content[0].image
         JsonNode choicesNode = root.path("output").path("choices");
         if (choicesNode.isArray() && choicesNode.size() > 0) {
             JsonNode contentArr = choicesNode.get(0).path("message").path("content");
@@ -519,14 +424,12 @@ public class ChatServiceImpl implements ChatService {
             }
         }
 
-        // 尝试 DashScope text2image 格式: output.results[0].url
         JsonNode resultsNode = root.path("output").path("results");
         if (resultsNode.isArray() && resultsNode.size() > 0) {
             String url = resultsNode.get(0).path("url").asText("");
             if (!url.isEmpty()) return url;
         }
 
-        // 回退 OpenAI 格式: data[0].url
         JsonNode dataNode = root.path("data");
         if (dataNode.isArray() && dataNode.size() > 0) {
             String url = dataNode.get(0).path("url").asText("");
@@ -536,9 +439,6 @@ public class ChatServiceImpl implements ChatService {
         throw new RuntimeException("图像API返回格式异常，无法提取图片URL: " + response.body());
     }
 
-    /**
-     * 创建空白白色 PNG 图片，用于纯图像生成时作为基底
-     */
     private byte[] createBlankImage(int width, int height) throws Exception {
         java.awt.image.BufferedImage image = new java.awt.image.BufferedImage(width, height, java.awt.image.BufferedImage.TYPE_INT_RGB);
         java.awt.Graphics2D g2d = image.createGraphics();
@@ -551,9 +451,6 @@ public class ChatServiceImpl implements ChatService {
         return baos.toByteArray();
     }
 
-    /**
-     * 解析尺寸字符串，如 "1024*1024" -> [1024, 1024]
-     */
     private int[] parseSize(String size) {
         if (size == null || size.isBlank()) {
             return new int[]{1024, 1024};
@@ -566,13 +463,7 @@ public class ChatServiceImpl implements ChatService {
         }
     }
 
-    /**
-     * 增强图片编辑提示词，通过结构化指令防止文字重影/排版变化
-     * 策略：将保留约束放在提示词最前面（模型对开头更敏感）
-     * 注意：qwen-image-edit-max API 不支持 system 消息，所有约束必须嵌入 user 消息的 text 中
-     */
     private String enhanceEditPrompt(String userPrompt) {
-        // 如果用户提示词中已包含文字相关指令，则不重复追加
         if (userPrompt.contains("文字") || userPrompt.contains("字体") || userPrompt.contains("文本")
                 || userPrompt.contains("text") || userPrompt.contains("Text")) {
             return userPrompt;
@@ -586,10 +477,6 @@ public class ChatServiceImpl implements ChatService {
                 我的修改要求：%s""".formatted(userPrompt);
     }
 
-    /**
-     * 检测图片尺寸，返回 "宽*高" 格式字符串
-     * 自动将尺寸调整到 API 有效范围 [512, 2048]，同时保持宽高比
-     */
     private String detectImageSize(byte[] imageData) {
         try {
             java.awt.image.BufferedImage image = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(imageData));
@@ -606,14 +493,10 @@ public class ChatServiceImpl implements ChatService {
         return "1024*1024";
     }
 
-    /**
-     * 将宽高调整到 API 有效范围 [512, 2048]，保持宽高比
-     */
     private int[] clampToValidRange(int width, int height) {
         final int MIN = 512;
         final int MAX = 2048;
 
-        // 如果已经在有效范围内，直接返回
         if (width >= MIN && width <= MAX && height >= MIN && height <= MAX) {
             return new int[]{width, height};
         }
@@ -621,7 +504,6 @@ public class ChatServiceImpl implements ChatService {
         double ratio = (double) width / height;
 
         if (width < MIN || height < MIN) {
-            // 太小，按短边缩放到 MIN
             if (width <= height) {
                 width = MIN;
                 height = (int) Math.round(width / ratio);
@@ -632,7 +514,6 @@ public class ChatServiceImpl implements ChatService {
         }
 
         if (width > MAX || height > MAX) {
-            // 太大，按长边缩放到 MAX
             if (width >= height) {
                 width = MAX;
                 height = (int) Math.round(width / ratio);
@@ -645,26 +526,6 @@ public class ChatServiceImpl implements ChatService {
         return new int[]{width, height};
     }
 
-    /**
-     * 根据文件扩展名确定MIME类型
-     */
-    private String determineMimeType(String filename) {
-        if (filename == null) {
-            return "image/png";
-        }
-        String extension = filename.substring(filename.lastIndexOf('.') + 1).toLowerCase();
-        return switch (extension) {
-            case "jpg", "jpeg" -> "image/jpeg";
-            case "png" -> "image/png";
-            case "gif" -> "image/gif";
-            case "webp" -> "image/webp";
-            default -> "image/png";
-        };
-    }
-
-    /**
-     * 根据模型名称获取对应的 ChatClient
-     */
     private ChatClient getChatClient(String model) {
         return switch (model.toLowerCase()) {
             case "openai" -> openAiChatClient;
@@ -675,14 +536,44 @@ public class ChatServiceImpl implements ChatService {
         };
     }
 
+    private String downloadImageToLocal(String imageUrl, String conversationId) throws Exception {
+        String filename = extractFilenameFromUrl(imageUrl);
+        String extension = filename.contains(".") ? filename.substring(filename.lastIndexOf('.')) : ".png";
+        String uniqueFilename = conversationId + "_" + UUID.randomUUID().toString() + extension;
+
+        java.nio.file.Path uploadPath = java.nio.file.Paths.get("uploads").toAbsolutePath();
+        java.nio.file.Files.createDirectories(uploadPath);
+
+        java.net.URL url = new java.net.URL(imageUrl);
+        java.io.InputStream inputStream = url.openStream();
+        java.nio.file.Path outputPath = uploadPath.resolve(uniqueFilename);
+        java.nio.file.Files.copy(inputStream, outputPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        inputStream.close();
+
+        logger.info("图片已下载到: {}", outputPath);
+        return "/uploads/" + uniqueFilename;
+    }
+
+    private String extractFilenameFromUrl(String url) {
+        try {
+            String path = new java.net.URL(url).getPath();
+            String filename = path.substring(path.lastIndexOf('/') + 1);
+            if (filename.isEmpty()) {
+                return "generated_image.png";
+            }
+            return filename;
+        } catch (Exception e) {
+            return "generated_image.png";
+        }
+    }
+
     // ==================== DeepSeek 原生 HTTP 调用（支持 reasoning_content 回传 + 工具调用） ====================
 
     /**
-     * 检查会话历史中是否存在带 reasoning_content 的 assistant 消息
-     * 如果存在，后续请求必须走 HTTP 直连路径以确保 reasoning_content 被回传
+     * 检查上下文消息中是否存在带 reasoning_content 的 assistant 消息
+     * （基于已加载的上下文，避免再次查询数据库）
      */
-    private boolean hasReasoningContentInHistory(String conversationId) {
-        List<ChatMessage> messages = conversationRepository.findMessagesByConversationId(conversationId);
+    private boolean hasReasoningContentInHistory(List<ChatMessage> messages) {
         for (ChatMessage msg : messages) {
             if ("assistant".equals(msg.getRole())
                     && msg.getReasoningContent() != null
@@ -695,41 +586,33 @@ public class ChatServiceImpl implements ChatService {
 
     /**
      * 构建原始消息列表（用于 DeepSeek 直连调用）
-     * @param conversationId 会话ID
-     * @param includeReasoning 是否在 assistant 消息中包含 reasoning_content
      */
-    private List<Map<String, Object>> buildRawContextMessages(String conversationId, boolean includeReasoning) {
-        List<Map<String, Object>> messages = new ArrayList<>();
-        List<ChatMessage> chatMessages = conversationRepository.findMessagesByConversationId(conversationId);
-        for (ChatMessage msg : chatMessages) {
+    private List<Map<String, Object>> buildRawContextMessages(List<ChatMessage> messages, boolean includeReasoning) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (ChatMessage msg : messages) {
             Map<String, Object> message = new HashMap<>();
             message.put("role", msg.getRole());
             message.put("content", msg.getContent());
             if ("assistant".equals(msg.getRole()) && includeReasoning) {
-                // 思考模式下：所有 assistant 消息都必须带 reasoning_content 字段
-                // 有实际内容则用实际内容，没有则补空字符串（API 强制要求）
                 String rc = (msg.getReasoningContent() != null && !msg.getReasoningContent().isBlank())
                         ? msg.getReasoningContent() : "";
                 message.put("reasoning_content", rc);
             }
-            messages.add(message);
+            result.add(message);
         }
-        return messages;
+        return result;
     }
 
     /**
      * 从 @Tool 注解的 Bean 中提取工具定义，转换为 OpenAI function schema 格式
-     * 使用 ClassUtils.getUserClass() 解决 Spring CGLIB 代理类导致注解不可见的问题
+     * 启动时一次性构建并缓存，避免每次请求反射扫描
      */
     private List<Map<String, Object>> buildToolDefinitions() {
         List<Map<String, Object>> tools = new ArrayList<>();
 
-        // 1. 扫描本地 @Tool 注解的 Bean
         if (allToolCallbacks != null) {
             for (Object bean : allToolCallbacks) {
                 Class<?> userClass = ClassUtils.getUserClass(bean.getClass());
-                logger.debug("检查工具类: {} (原始: {})", userClass.getSimpleName(), bean.getClass().getSimpleName());
-
                 for (Method method : userClass.getDeclaredMethods()) {
                     Tool toolAnnotation = method.getAnnotation(Tool.class);
                     if (toolAnnotation == null) continue;
@@ -762,13 +645,10 @@ public class ChatServiceImpl implements ChatService {
                     toolDef.put("type", "function");
                     toolDef.put("function", function);
                     tools.add(toolDef);
-
-                    logger.info("注册本地工具: {} - 参数: {}", method.getName(), properties.keySet());
                 }
             }
         }
 
-        // 2. 扫描 MCP 工具（来自 SyncMcpToolCallbackProvider）
         if (mcpToolProvider != null) {
             try {
                 ToolCallback[] mcpCallbacks = mcpToolProvider.getToolCallbacks();
@@ -778,12 +658,10 @@ public class ChatServiceImpl implements ChatService {
                         Map<String, Object> function = new HashMap<>();
                         function.put("name", toolDef.name());
                         function.put("description", toolDef.description());
-                        // inputSchema 已经是 JSON schema 字符串，解析为 Map
                         try {
                             Map<String, Object> schema = objectMapper.readValue(toolDef.inputSchema(), Map.class);
                             function.put("parameters", schema);
                         } catch (Exception e) {
-                            // 如果解析失败，使用空 schema
                             function.put("parameters", Map.of("type", "object", "properties", Map.of()));
                         }
 
@@ -791,8 +669,6 @@ public class ChatServiceImpl implements ChatService {
                         toolEntry.put("type", "function");
                         toolEntry.put("function", function);
                         tools.add(toolEntry);
-
-                        logger.info("注册 MCP 工具: {} - {}", toolDef.name(), toolDef.description());
                     }
                 }
             } catch (Exception e) {
@@ -800,16 +676,10 @@ public class ChatServiceImpl implements ChatService {
             }
         }
 
-        logger.info("共提取 {} 个工具定义（本地 + MCP）", tools.size());
         return tools;
     }
 
-    /**
-     * 通过反射执行 @Tool 注解的方法
-     * 使用 ClassUtils.getUserClass() 解决 CGLIB 代理问题
-     */
     private String executeToolCall(String functionName, String argumentsJson) {
-        // 1. 先尝试本地 @Tool Bean
         if (allToolCallbacks != null) {
             for (Object bean : allToolCallbacks) {
                 Class<?> userClass = ClassUtils.getUserClass(bean.getClass());
@@ -841,7 +711,6 @@ public class ChatServiceImpl implements ChatService {
             }
         }
 
-        // 2. 再尝试 MCP 工具
         if (mcpToolProvider != null) {
             try {
                 ToolCallback[] mcpCallbacks = mcpToolProvider.getToolCallbacks();
@@ -865,13 +734,11 @@ public class ChatServiceImpl implements ChatService {
 
     /**
      * 直接调用 DeepSeek API（绕过 Spring AI），支持工具调用循环
-     * @param messages 消息列表
-     * @param thinkingMode 是否启用思考模式
-     * @return [content, reasoning_content]
      */
     private String[] callDeepSeekRaw(List<Map<String, Object>> messages, boolean thinkingMode) throws Exception {
-        List<Map<String, Object>> toolDefinitions = buildToolDefinitions();
-        int maxTurns = 10; // 防止无限循环
+        // 使用启动时缓存的工具定义，避免每次请求反射扫描
+        List<Map<String, Object>> toolDefinitions = cachedToolDefinitions;
+        int maxTurns = 10;
 
         String finalContent = "";
         String finalReasoningContent = null;
@@ -898,7 +765,20 @@ public class ChatServiceImpl implements ChatService {
                     .timeout(java.time.Duration.ofSeconds(120))
                     .build();
 
-            HttpResponse<String> response = imageHttpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+            // 使用全局共享的 HttpClient（带连接池）
+            // 用熔断器 + 限流器包装 HTTP 调用，保护下游 AI 网关
+            final HttpRequest finalHttpRequest = httpRequest;
+            java.util.function.Supplier<HttpResponse<String>> httpCall = () -> {
+                try {
+                    return aiCircuitBreaker.decorateCheckedSupplier(
+                            (io.github.resilience4j.core.functions.CheckedSupplier<HttpResponse<String>>) () ->
+                                    httpClient.send(finalHttpRequest, HttpResponse.BodyHandlers.ofString())
+                    ).get();
+                } catch (Throwable t) {
+                    throw new RuntimeException("DeepSeek HTTP 调用失败: " + t.getMessage(), t);
+                }
+            };
+            HttpResponse<String> response = aiRateLimiter.executeSupplier(httpCall);
 
             if (response.statusCode() != 200) {
                 logger.error("DeepSeek API 错误: {} - {}", response.statusCode(), response.body());
@@ -914,10 +794,8 @@ public class ChatServiceImpl implements ChatService {
             String reasoningContent = messageNode.has("reasoning_content") && !messageNode.get("reasoning_content").isNull()
                     ? messageNode.get("reasoning_content").asText() : null;
 
-            // 检查是否有工具调用
             JsonNode toolCalls = messageNode.get("tool_calls");
             if (toolCalls == null || !toolCalls.isArray() || toolCalls.isEmpty()) {
-                // 没有工具调用，这是最终回答
                 finalContent = content;
                 finalReasoningContent = reasoningContent;
                 logger.info("DeepSeek 最终响应 (turn {}) - content长度: {}, reasoning长度: {}",
@@ -925,15 +803,12 @@ public class ChatServiceImpl implements ChatService {
                 break;
             }
 
-            // 有工具调用：将 assistant 消息（含 tool_calls）加入 messages
             Map<String, Object> assistantMsg = new HashMap<>();
             assistantMsg.put("role", "assistant");
             assistantMsg.put("content", content.isEmpty() ? null : content);
             if (thinkingMode) {
-                // 思考模式下所有 assistant 消息都必须带 reasoning_content
                 assistantMsg.put("reasoning_content", reasoningContent != null ? reasoningContent : "");
             }
-            // 构建 tool_calls 数组
             List<Map<String, Object>> toolCallsList = new ArrayList<>();
             for (JsonNode tc : toolCalls) {
                 Map<String, Object> toolCall = new HashMap<>();
@@ -948,7 +823,6 @@ public class ChatServiceImpl implements ChatService {
             assistantMsg.put("tool_calls", toolCallsList);
             messages.add(assistantMsg);
 
-            // 执行每个工具调用并将结果加入 messages
             for (JsonNode tc : toolCalls) {
                 String toolCallId = tc.get("id").asText();
                 String funcName = tc.get("function").get("name").asText();
@@ -972,23 +846,19 @@ public class ChatServiceImpl implements ChatService {
 
     /**
      * 从会话历史构建 Spring AI 的 Message 列表（上下文）
-     * 将 ChatMessage 转换为 Spring AI 的 Message 接口实现
      */
-    private List<Message> buildContextMessages(String conversationId) {
+    private List<Message> buildContextMessages(List<ChatMessage> chatMessages) {
         List<Message> messages = new ArrayList<>();
-        List<ChatMessage> chatMessages = conversationRepository.findMessagesByConversationId(conversationId);
         for (ChatMessage msg : chatMessages) {
             switch (msg.getRole()) {
                 case "user" -> messages.add(new UserMessage(msg.getContent()));
                 case "assistant" -> {
                     AssistantMessage assistantMessage = new AssistantMessage(msg.getContent());
-                    // 如果有 reasoning_content（DeepSeek 思考模式），必须通过 metadata 回传给 API
                     if (msg.getReasoningContent() != null && !msg.getReasoningContent().isBlank()) {
                         assistantMessage.getMetadata().put("reasoningContent", msg.getReasoningContent());
                     }
                     messages.add(assistantMessage);
                 }
-                // system 消息可根据需要扩展
             }
         }
         return messages;

@@ -8,6 +8,7 @@ import org.apache.lucene.document.Field;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.document.TextField;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.Term;
@@ -15,9 +16,10 @@ import org.apache.lucene.queryparser.classic.QueryParser;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.SearcherManager;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.NIOFSDirectory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.document.Document;
@@ -58,29 +60,52 @@ public class Bm25IndexService {
 
     private Directory directory;
     private Analyzer analyzer;
+    private IndexWriter writer;
+    private SearcherManager searcherManager;
 
-    /** 写锁：Lucene 同一目录同一时刻只允许一个 IndexWriter，串行化写入以规避锁冲突。 */
-    private final Object writeLock = new Object();
+    /** 读写锁：Lucene 同一目录只允许一个 IndexWriter，且读写不可并发，避免 Windows 文件句柄冲突。 */
+    private final Object rwLock = new Object();
 
     @PostConstruct
     public void init() throws IOException {
         Path path = Paths.get(indexDir).toAbsolutePath();
-        this.directory = FSDirectory.open(path);
+        // 使用 NIOFSDirectory 而非默认的 MMapDirectory：
+        // Windows 上 mmap 的文件句柄在 GC 前无法 rename/delete，会导致 commit 时 FileSystemException
+        this.directory = new NIOFSDirectory(path);
         this.analyzer = new SmartChineseAnalyzer();
+        IndexWriterConfig config = new IndexWriterConfig(analyzer);
+        config.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
+        this.writer = new IndexWriter(directory, config);
+        // SearcherManager 统一管理 reader 生命周期，避免每次 search 都 open/close reader
+        this.searcherManager = new SearcherManager(writer, true, true, null);
         logger.info("BM25 索引目录初始化完成: {}", path);
     }
 
     @PreDestroy
     public void close() {
         try {
+            if (searcherManager != null) {
+                searcherManager.close();
+            }
+        } catch (IOException e) {
+            logger.warn("关闭 SearcherManager 失败", e);
+        }
+        try {
+            if (writer != null) {
+                writer.close();
+            }
+        } catch (IOException e) {
+            logger.warn("关闭 IndexWriter 失败", e);
+        }
+        try {
             if (directory != null) {
                 directory.close();
             }
-            if (analyzer != null) {
-                analyzer.close();
-            }
         } catch (IOException e) {
-            logger.warn("关闭 BM25 索引资源失败", e);
+            logger.warn("关闭 Directory 失败", e);
+        }
+        if (analyzer != null) {
+            analyzer.close();
         }
     }
 
@@ -93,10 +118,8 @@ public class Bm25IndexService {
         if (documents == null || documents.isEmpty()) {
             return;
         }
-        synchronized (writeLock) {
-            IndexWriterConfig config = new IndexWriterConfig(analyzer);
-            config.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
-            try (IndexWriter writer = new IndexWriter(directory, config)) {
+        synchronized (rwLock) {
+            try {
                 int count = 0;
                 for (Document doc : documents) {
                     String text = doc.getText();
@@ -111,6 +134,8 @@ public class Bm25IndexService {
                     count++;
                 }
                 writer.commit();
+                // 刷新 searcher，使新写入的文档对后续 search 可见
+                searcherManager.maybeRefresh();
                 logger.info("BM25 索引写入 {} 个 Document", count);
             } catch (IOException e) {
                 logger.error("BM25 索引写入失败", e);
@@ -130,13 +155,11 @@ public class Bm25IndexService {
         if (!StringUtils.hasText(queryText) || topN <= 0) {
             return List.of();
         }
-        try {
-            // 索引目录还没有任何 segment（例如存量数据未回灌）时优雅返回空
-            if (!DirectoryReader.indexExists(directory)) {
-                return List.of();
-            }
-            try (DirectoryReader reader = DirectoryReader.open(directory)) {
-                IndexSearcher searcher = new IndexSearcher(reader);
+        synchronized (rwLock) {
+            // SearcherManager.acquire() 复用 reader，避免每次 search 都重新打开
+            IndexSearcher searcher = null;
+            try {
+                searcher = searcherManager.acquire();
                 QueryParser parser = new QueryParser(FIELD_CONTENT, analyzer);
                 // 转义 Lucene 语法保留字符，避免中文/符号混排导致解析异常
                 Query query = parser.parse(QueryParser.escape(queryText));
@@ -148,10 +171,18 @@ public class Bm25IndexService {
                     hits.add(new Bm25Hit(d.get(FIELD_ID), d.get(FIELD_CONTENT), scoreDoc.score));
                 }
                 return hits;
+            } catch (Exception e) {
+                logger.warn("BM25 检索失败，降级为空结果: {}", e.getMessage());
+                return List.of();
+            } finally {
+                if (searcher != null) {
+                    try {
+                        searcherManager.release(searcher);
+                    } catch (IOException e) {
+                        logger.warn("释放 IndexSearcher 失败", e);
+                    }
+                }
             }
-        } catch (Exception e) {
-            logger.warn("BM25 检索失败，降级为空结果: {}", e.getMessage());
-            return List.of();
         }
     }
 
